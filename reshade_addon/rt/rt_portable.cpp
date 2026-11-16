@@ -32,7 +32,7 @@
 #include "../mods/game_cb_reader.h"
 #include "../mods/wwmi_runtime.h" // WwmiReadFile, WwmiMakeBuffer
 #include "../addon/addon.h"        // g_addon.cso_dir
-#include "../addon/settings.h"     // g_settings.rt_experimental
+#include "../addon/settings.h"     // g_settings.ptskin_test
 #include "../core/dxil_cb.h"
 #include "../migoto/dx12_pipeline.h"     // MigotoPort::State, OwnedTransition
 #include "../migoto/dx12_input_layout.h" // MigotoPort::DescribeInputLayout
@@ -861,7 +861,7 @@ void RecordSkinSection(reshade::api::command_list* cmd_list, const CmdState& sta
 void RtPalRecorder::Record(reshade::api::command_list* cmd_list, const CmdState& state, uint64_t cs_hash)
 {
     if (g_rt_rings.Count() == 0) return;
-    if (g_settings.rt_experimental) RecordSkinSection(cmd_list, state, cs_hash);
+    RecordSkinSection(cmd_list, state, cs_hash);
     if (!g_debug) return;
     const uint32_t ring_gen = g_rt_rings.Gen();
     {
@@ -1727,7 +1727,7 @@ VfRestore RtDrawPass::SkinDraw(reshade::api::command_list* cmd_list, ID3D12Graph
     const WwmiMod::Component* wc, uint32_t, uint32_t, uint32_t, uint32_t, int32_t vertex_offset, uint64_t, uint64_t, int,
     bool)
 {
-    if (!g_settings.rt_experimental || !wc || !d3d12_cl || dm < 0) return {};
+    if (!wc || !d3d12_cl || dm < 0) return {};
     const CmdState& state = g_command_lists.Gfx(cmd_list);
     if (!IsPassThroughPso(state.gfx_pso)) return {};
     const int comp = wc->index;
@@ -2206,5 +2206,5 @@ void RtDrawOverlay()
 
 bool RtModulePresent()
 {
-    return false; // nothing is drawn under RT yet: rt_experimental decides whether mods stay on
+    return true; // the mods stay on while the game ray traces, whatever the ini's rt_experimental says
 }
