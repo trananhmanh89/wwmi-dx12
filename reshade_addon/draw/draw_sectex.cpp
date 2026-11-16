@@ -205,6 +205,22 @@ uint16_t SectionTexturePublisher::Publish(command_list* cmd_list, int dm, int co
                     : 0u;
                 PortApi::PushGameTexture('p', r, ri.res, known ? hash : resident, fmt);
                 pushed |= (uint16_t)(1u << r);
+                // What a `ps-tN == x` test in the mod sees in this slot: the texture's shape and its filter_index.
+                if (g_debug && every_slot && ri.res) {
+                    const D3D12_RESOURCE_DESC rd = ri.res->GetDesc();
+                    const float filter = PortApi::PublishedTextureFilter('p', r);
+                    const unsigned long long seen = (unsigned long long)resident << 32 ^
+                        (unsigned long long)rd.Format << 20 ^ (unsigned long long)rd.MipLevels << 12 ^
+                        (unsigned long long)(filter * 100.0f);
+                    if (DiagChanged("SECSLOT",
+                            (int)(((unsigned)CompKey(dm, comp) * 16u + r) ^ (unsigned)(ps_hash * 0x9E3779B97F4A7C15ull >> 40)),
+                            seen))
+                        logger::write("SECSLOT f=%u mod=%d comp=%d ps-t%u ps=%016llx: %08x%s %llux%u mips=%u "
+                                      "format=%u view=%u -> filter_index=%.4f",
+                            g_frame_id, dm, comp, r, (unsigned long long)ps_hash, known ? hash : resident,
+                            known ? "" : " (no section)", (unsigned long long)rd.Width, rd.Height,
+                            (unsigned)rd.MipLevels, (unsigned)rd.Format, fmt, filter);
+                }
             }
             if (!known) return;
             if (g_debug) {

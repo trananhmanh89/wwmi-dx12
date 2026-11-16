@@ -102,6 +102,10 @@ with a `wwmi-dx12` window showing "Active mods" above 0.
 ## Mod Installation
 
 1. Extract the mod's archive into the `Mods` folder of your WWMI folder (one folder for DX11 and DX12).
+   To give DX12 its own set, make a `Mods_dx12` folder next to `Mods`: when it exists, DX12 reads its mods
+   from there and DX11 keeps `Mods` (`mods_folder` in `wwmi_dx12.ini` picks another name). DX12 then saves its
+   in-game toggles in `d3dx_user_dx12.ini`, and at each start copies over the toggles DX11 saved for any mod
+   you copied in that DX12 has no value for yet.
 2. Check it in DX11 if it looks wrong here.
 
 ## Hotkeys

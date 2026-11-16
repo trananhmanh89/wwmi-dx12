@@ -19,6 +19,14 @@ struct ModPipeline;
 namespace PortApi {
 
 bool Load(const wchar_t* ini_root);
+// The folder (under the WWMI folder) to read mods from in place of d3dx.ini's `include_recursive = Mods`,
+// for example L"Mods_dx12". Empty: Mods, as d3dx.ini says. Call before Load.
+void SetModsFolder(const wchar_t* folder);
+// The folder SetModsFolder set, or empty.
+const wchar_t* ModsFolder();
+// The file (in the WWMI folder) that keeps in-game toggles while ModsFolder is set: DX11 keeps d3dx_user.ini,
+// and a shared file would let each side clear the other's settings as "unknown".
+const wchar_t* ModsUserConfig();
 void SaveSettingsOnExit();
 
 void SetFrameContext(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, ID3D12CommandQueue* queue, unsigned rt_width,
@@ -151,6 +159,9 @@ bool PipeStateCbBound(char stage, unsigned slot);
 int PushGameTexture(char stage, unsigned slot, ID3D12Resource* res, unsigned content_hash, unsigned view_format = 0);
 // Clears <stage>-tN only while it still holds what PushGameTexture put there.
 void UnpushGameTexture(char stage, unsigned slot);
+// The filter_index a `<stage>-tN == x` test would see for what PushGameTexture last put in that slot:
+// the last matching [TextureOverride] section's, 1 when one matches without it, 0 when none matches.
+float PublishedTextureFilter(char stage, unsigned slot);
 // Some [TextureOverride] section is keyed on this hash (true before the first parse).
 bool TextureHashHasSections(uint32_t hash);
 

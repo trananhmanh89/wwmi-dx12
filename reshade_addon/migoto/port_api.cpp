@@ -84,6 +84,25 @@ static void NotifyParse(std::chrono::steady_clock::time_point parse_start)
     if (g_parse_observer) g_parse_observer(g_parse_observer_user);
 }
 
+namespace {
+std::wstring g_mods_folder;
+}
+
+void SetModsFolder(const wchar_t* folder)
+{
+    g_mods_folder = folder ? folder : L"";
+}
+
+const wchar_t* ModsFolder()
+{
+    return g_mods_folder.c_str();
+}
+
+const wchar_t* ModsUserConfig()
+{
+    return L"d3dx_user_dx12.ini";
+}
+
 bool Load(const wchar_t* ini_root)
 {
     if (g_loaded) return true;

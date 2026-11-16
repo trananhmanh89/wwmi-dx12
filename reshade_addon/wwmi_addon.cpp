@@ -2,6 +2,7 @@
 // and the DLL's unload. The hooks' bodies live in their modules; the ones that need the SEH guard are wrapped here.
 #include "addon_common.h"
 #include <shlwapi.h>
+#include <map>
 #include "migoto/dump_preview.h"
 #include "mods/character_recognition.h"
 #include "mods/component_table.h"
@@ -217,6 +218,117 @@ static void on_present(command_queue* queue, swapchain* sc, const rect*, const r
 }
 
 // Our folders under the game's: the mod tree (wwmi_dir from the ini), the data and cache directories.
+namespace {
+
+/**
+ * Reads a saved-toggles file (d3dx_user.ini style, UTF-8) into key -> whole line.
+ *
+ * @param path The file to read.
+ * @param keys Receives each `$\...` key, lower-cased, with its line as written.
+ * @return False when the file cannot be opened.
+ */
+bool ReadSavedToggles(const std::wstring& path, std::map<std::wstring, std::wstring>& keys)
+{
+    FILE* file = nullptr;
+    if (_wfopen_s(&file, path.c_str(), L"rb") != 0 || !file) return false;
+    std::string bytes;
+    char buffer[4096];
+    size_t read = 0;
+    while ((read = fread(buffer, 1, sizeof(buffer), file)) > 0) bytes.append(buffer, read);
+    fclose(file);
+
+    const int length = MultiByteToWideChar(CP_UTF8, 0, bytes.data(), (int)bytes.size(), nullptr, 0);
+    std::wstring text(length, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, bytes.data(), (int)bytes.size(), text.data(), length);
+
+    size_t start = 0;
+    while (start < text.size()) {
+        size_t end = text.find(L'\n', start);
+        if (end == std::wstring::npos) end = text.size();
+        std::wstring line = text.substr(start, end - start);
+        start = end + 1;
+        while (!line.empty() && (line.back() == L'\r' || line.back() == L' ')) line.pop_back();
+        if (line.size() < 2 || line[0] != L'$') continue;
+        const size_t equals = line.find(L'=');
+        if (equals == std::wstring::npos) continue;
+        std::wstring key = line.substr(0, equals);
+        while (!key.empty() && key.back() == L' ') key.pop_back();
+        CharLowerBuffW(key.data(), (DWORD)key.size());
+        keys[key] = line;
+    }
+    return true;
+}
+
+/**
+ * Gives DX12 the toggles DX11 saved for the mods that were copied into DX12's mods folder.
+ *
+ * DX11 keeps them in d3dx_user.ini under `$\mods\<mod path>\...`; DX12 keeps its own in
+ * PortApi::ModsUserConfig() under `$\<mods folder>\<mod path>\...`. A toggle is copied only while DX12 has no
+ * value for it yet, so what you change in DX12 stays. Toggles that are not tied to a mod path (for example
+ * `$\rabbitfx\censor`) are copied the same way.
+ *
+ * @param wwmi_dir    The WWMI folder (with d3dx.ini).
+ * @param mods_folder DX12's mods folder name inside it, e.g. Mods_dx12.
+ */
+void CopyDx11Toggles(const std::wstring& wwmi_dir, const std::wstring& mods_folder)
+{
+    wchar_t dx11_name[MAX_PATH] = {};
+    GetPrivateProfileStringW(L"Include", L"user_config", L"d3dx_user.ini", dx11_name, MAX_PATH,
+        (wwmi_dir + L"\\d3dx.ini").c_str());
+    const std::wstring dx11_path = PathIsRelativeW(dx11_name) ? wwmi_dir + L"\\" + dx11_name : dx11_name;
+    const std::wstring dx12_path = wwmi_dir + L"\\" + PortApi::ModsUserConfig();
+
+    std::map<std::wstring, std::wstring> dx11;
+    std::map<std::wstring, std::wstring> dx12;
+    if (!ReadSavedToggles(dx11_path, dx11)) return;
+    const bool dx12_exists = ReadSavedToggles(dx12_path, dx12);
+
+    std::wstring dx12_prefix = L"$\\" + mods_folder + L"\\";
+    CharLowerBuffW(dx12_prefix.data(), (DWORD)dx12_prefix.size());
+    const std::wstring dx11_prefix = L"$\\mods\\";
+
+    std::wstring added;
+    unsigned count = 0;
+    for (const auto& entry : dx11) {
+        const std::wstring& key = entry.first;
+        std::wstring line = entry.second;
+        std::wstring dx12_key = key;
+        if (key.compare(0, dx11_prefix.size(), dx11_prefix) == 0) {
+            // $\mods\<mod path>\mod.ini\<name>: only for mods that are in DX12's folder too.
+            const std::wstring rest = key.substr(dx11_prefix.size());
+            const size_t name_start = rest.rfind(L'\\');
+            if (name_start == std::wstring::npos) continue;
+            const std::wstring mod_ini = wwmi_dir + L"\\" + mods_folder + L"\\" + rest.substr(0, name_start);
+            if (GetFileAttributesW(mod_ini.c_str()) == INVALID_FILE_ATTRIBUTES) continue;
+            dx12_key = dx12_prefix + rest;
+            const std::wstring value = line.substr(line.find(L'=') + 1);
+            line = dx12_key + L" =" + value;
+        } else if (key.compare(0, dx12_prefix.size(), dx12_prefix) == 0) {
+            continue;
+        }
+        if (dx12.count(dx12_key)) continue;
+        added += line + L"\n";
+        ++count;
+    }
+    if (!count) return;
+
+    std::wstring text = dx12_exists ? L"\n" + added
+        : L"; DX12's saved toggles (WWMI-DX12). DX11 keeps its own in d3dx_user.ini.\n[Constants]\n" + added;
+    const int length = WideCharToMultiByte(CP_UTF8, 0, text.data(), (int)text.size(), nullptr, 0, nullptr, nullptr);
+    std::string bytes(length, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, text.data(), (int)text.size(), bytes.data(), length, nullptr, nullptr);
+    FILE* file = nullptr;
+    if (_wfopen_s(&file, dx12_path.c_str(), L"ab") != 0 || !file) {
+        ::logger::write("Config: could not write %S", dx12_path.c_str());
+        return;
+    }
+    fwrite(bytes.data(), 1, bytes.size(), file);
+    fclose(file);
+    ::logger::write("Config: copied %u saved toggle(s) from %S to %S", count, dx11_path.c_str(), dx12_path.c_str());
+}
+
+} // namespace
+
 static void SetupDirectories()
 {
     wchar_t wwmi_dir_buf[MAX_PATH] = {};
@@ -262,6 +374,18 @@ static void SetupDirectories()
             shaders, lod ? "the" : "no");
     }
     g_addon.wwmi_dir = wwmi_dir_buf;
+    {
+        // DX12's own mods folder: mods_folder in wwmi_dx12.ini (default Mods_dx12), used when it exists under the
+        // WWMI folder; otherwise the Mods folder d3dx.ini names, which DX11 uses too.
+        std::wstring mods_folder = g_settings.String(L"mods_folder");
+        if (mods_folder.empty()) mods_folder = L"Mods_dx12";
+        const DWORD attributes = GetFileAttributesW((g_addon.wwmi_dir + L"\\" + mods_folder).c_str());
+        const bool usable = _wcsicmp(mods_folder.c_str(), L"Mods") != 0 && attributes != INVALID_FILE_ATTRIBUTES &&
+            (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        PortApi::SetModsFolder(usable ? mods_folder.c_str() : L"");
+        if (usable) CopyDx11Toggles(g_addon.wwmi_dir, mods_folder);
+        ::logger::write("Config: mods from %S", usable ? mods_folder.c_str() : L"Mods (as d3dx.ini says)");
+    }
     g_mod_textures.Reload(); // deferred -- executes on first Tick() after device init
     g_tex_lod.Init(cache_dir);
     g_tex_look.Init(cache_dir);

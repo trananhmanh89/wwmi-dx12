@@ -577,6 +577,22 @@ int PushGameTexture(char stage, unsigned slot, ID3D12Resource* res, unsigned con
     return result;
 }
 
+float PublishedTextureFilter(char stage, unsigned slot)
+{
+    std::lock_guard<std::recursive_mutex> engine_lk(EngineLock());
+    if (!g_loaded) return 0.0f;
+    const int si = MigotoPort::StageIndex(stage);
+    if (si < 0 || slot >= (unsigned)MigotoPort::kMaxSRV) return 0.0f;
+    MigotoPort::WrapTexture2D* w = g_gametex_res.Find({ si, slot });
+    if (!w || !w->dx12) return 0.0f;
+    TextureOverrideMatches matches;
+    find_texture_overrides_for_resource((ID3D11Resource*)w, &matches, nullptr);
+    if (matches.empty()) return 0.0f;
+    for (auto it = matches.rbegin(); it != matches.rend(); ++it)
+        if ((*it)->filter_index != FLT_MAX) return (*it)->filter_index;
+    return 1.0f;
+}
+
 void UnpushGameTexture(char stage, unsigned slot)
 {
     std::lock_guard<std::recursive_mutex> engine_lk(EngineLock());

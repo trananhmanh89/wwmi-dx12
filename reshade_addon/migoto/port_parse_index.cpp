@@ -629,6 +629,8 @@ static std::vector<std::wstring> IncludeRecursiveRoots(const std::wstring& d3dx_
         for (auto& ch : root)
             if (ch == L'/') ch = L'\\';
         while (!root.empty() && root.back() == L'\\') root.pop_back();
+        // The engine read the mods from the folder SetModsFolder chose (port_ini.cpp), so follow it here too.
+        if (ModsFolder()[0] && _wcsicmp(root.c_str(), L"Mods") == 0) root = ModsFolder();
         if (!root.empty()) roots.push_back(root);
     }
     return roots;
