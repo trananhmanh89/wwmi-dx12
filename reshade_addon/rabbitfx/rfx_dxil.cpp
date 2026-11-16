@@ -562,6 +562,8 @@ bool Cut(Module& m, const std::string& fn, int sig_node, const std::vector<RfxDx
     return true;
 }
 
+#include "../matcap/matcap_dxil.inc"
+
 bool PatchText(Module& m, const RfxDxilSpec& spec, RfxDxilResult& out)
 {
     std::string& why = out.why;
@@ -593,6 +595,7 @@ bool PatchText(Module& m, const RfxDxilSpec& spec, RfxDxilResult& out)
         why = "entry point has no signatures";
         return false;
     }
+    if (spec.matcap) return MatcapText(m, fn, sig_node, res_node, spec, out);
     if (!spec.cuts.empty()) return Cut(m, fn, sig_node, spec.cuts, out);
     if (!spec.inject) {
         const auto s0 = Operands(m.Node(sig_node));

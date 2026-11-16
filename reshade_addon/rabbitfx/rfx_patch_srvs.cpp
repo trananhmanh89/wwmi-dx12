@@ -43,6 +43,29 @@ bool RfxPatchSrvs::NullSrvs(D3D12_CPU_DESCRIPTOR_HANDLE* null_tex, D3D12_CPU_DES
     return true;
 }
 
+D3D12_CPU_DESCRIPTOR_HANDLE RfxPatchSrvs::ParamsSrvN(const float* values, unsigned texels)
+{
+    if (!values || texels == 0 || texels > 16) return { 0 };
+    if (!EnsureHeap() || !params_ring_.Ensure(g_addon.d3d12_device, kParamsBytes)) return { 0 };
+    uint64_t va = 0;
+    ID3D12Resource* ring = nullptr;
+    float* p = (float*)params_ring_.Take(&va, &ring);
+    if (!p) return { 0 };
+    memcpy(p, values, (size_t)texels * 4 * sizeof(float));
+    const uint64_t off = va - ring->GetGPUVirtualAddress();
+    D3D12_SHADER_RESOURCE_VIEW_DESC b = {};
+    b.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    b.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    b.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    b.Buffer.FirstElement = off / 16;
+    b.Buffer.NumElements = texels;
+    const uint32_t slot = 2 + next_.fetch_add(1, std::memory_order_relaxed) % (kSlots - 2);
+    const D3D12_CPU_DESCRIPTOR_HANDLE h = { heap_->GetCPUDescriptorHandleForHeapStart().ptr +
+        (SIZE_T)slot * g_rfx_shadow.Inc() };
+    g_addon.d3d12_device->CreateShaderResourceView(ring, &b, h);
+    return h;
+}
+
 D3D12_CPU_DESCRIPTOR_HANDLE RfxPatchSrvs::ParamsSrv(float hue, float sat, float val, float brightness)
 {
     if (!EnsureHeap() || !params_ring_.Ensure(g_addon.d3d12_device, kParamsBytes)) return { 0 };

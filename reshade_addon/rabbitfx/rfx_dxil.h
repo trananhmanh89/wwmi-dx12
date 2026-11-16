@@ -31,6 +31,11 @@ struct RfxDxilSpec {
     bool decensor = false;
     bool inject = true; // false: the decensor constants only, no SRVs added (the game's own root signature)
     std::vector<RfxDxilCut> cuts; // not empty: these cuts alone -- no RabbitFX blocks, no decensor
+    // true: the matcap patch alone (matcap_dxil.inc); every field above is ignored. It reads the game shader's own
+    // SV_Target1 normal and blends the matcap into SV_Target0 / SV_Target3 (the KatFXMatcap ini's ShaderRegex).
+    bool matcap = false;
+    unsigned matcap_reg = 53; // Texture2D t53 / t54: matcap layers 1 / 2; t55 / t56: their masks
+    unsigned matcap_params_reg = 57; // Buffer<float4>: [0] = x125..w125, [1] = x126..w126
 };
 
 // One float a shader reads from a constant buffer: cb<reg>[row].xyzw[comp]. reg 0xFF: not a plain CB load.

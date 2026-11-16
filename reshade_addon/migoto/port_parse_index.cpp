@@ -18,7 +18,9 @@
 #include <mutex>
 #include <functional>
 #include <map>
+#include <set>
 #include <string>
+#include <vector>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -357,12 +359,31 @@ bool Linkable(ShaderRegexGroup& g)
     return g.filter_index != FLT_MAX || !g.command_list.noop() || !g.post_command_list.noop();
 }
 
+/**
+ * Turns a ShaderRegex group key into "namespace\group" (lower case), the form GroupId(ns, group) builds.
+ *
+ * Keys look like "ShaderRegex\RabbitFX\Main" for [ShaderRegexMain] in an ini with namespace RabbitFX. A section
+ * that names its own namespace, such as [ShaderRegex\zKatFXMatcap\Matcap] in an ini with namespace KatFXMatcap,
+ * gets the ini's namespace added in front: "ShaderRegex\KatFXMatcap\\zKatFXMatcap\Matcap". Only the last two
+ * names count, so both forms give "rabbitfx\main" and "zkatfxmatcap\matcap".
+ *
+ * @param key The key of shader_regex_groups.
+ * @return "namespace\group" in lower case, or an empty string when the key has no namespace.
+ */
 std::wstring GroupId(const std::wstring& key)
 {
-    const size_t a = key.find(L'\\');
-    const size_t b = key.rfind(L'\\');
-    if (a == std::wstring::npos || b <= a) return std::wstring();
-    return LowerNs(key.substr(a + 1).c_str());
+    std::vector<std::wstring> parts;
+    size_t start = 0;
+    while (start <= key.size()) {
+        size_t end = key.find(L'\\', start);
+        if (end == std::wstring::npos) end = key.size();
+        if (end > start) parts.push_back(key.substr(start, end - start));
+        start = end + 1;
+    }
+    // parts[0] is "ShaderRegex"; a namespace and a group must follow.
+    if (parts.size() < 3) return std::wstring();
+    const std::wstring id = parts[parts.size() - 2] + L"\\" + parts[parts.size() - 1];
+    return LowerNs(id.c_str());
 }
 
 std::wstring GroupId(const wchar_t* ns, const wchar_t* group)
@@ -373,13 +394,15 @@ std::wstring GroupId(const wchar_t* ns, const wchar_t* group)
 struct ShaderRegexLinks {
     std::mutex mtx;
     unsigned gen = ~0u;
-    std::unordered_set<uint64_t> linked;
+    std::unordered_set<uint64_t> linked; // any group
+    std::set<std::pair<uint64_t, std::wstring>> linked_groups; // (shader, group id)
     std::unordered_set<std::wstring> loaded;
     void ForReload()
     {
         if (gen == g_generation) return;
         gen = g_generation;
         linked.clear();
+        linked_groups.clear();
         loaded.clear();
         for (auto& kv : shader_regex_groups) {
             if (!Linkable(kv.second)) continue;
@@ -406,6 +429,13 @@ bool ShaderRegexLinked(uint64_t ini_hash)
     return g_regex_links.gen == g_generation && g_regex_links.linked.count(ini_hash) != 0;
 }
 
+bool ShaderRegexLinked(uint64_t ini_hash, const wchar_t* ns, const wchar_t* group)
+{
+    if (!ns || !group) return false;
+    std::lock_guard<std::mutex> l(g_regex_links.mtx);
+    return g_regex_links.gen == g_generation && g_regex_links.linked_groups.count({ ini_hash, GroupId(ns, group) }) != 0;
+}
+
 bool LinkShaderRegexGroup(uint64_t ini_hash, const wchar_t* ns, const wchar_t* group)
 {
     if (!g_loaded || !ini_hash || !ns || !group) return false;
@@ -423,7 +453,8 @@ bool LinkShaderRegexGroup(uint64_t ini_hash, const wchar_t* ns, const wchar_t* g
     {
         std::lock_guard<std::mutex> l(g_regex_links.mtx);
         g_regex_links.ForReload();
-        if (!g_regex_links.linked.insert(ini_hash).second) return true;
+        g_regex_links.linked.insert(ini_hash);
+        if (!g_regex_links.linked_groups.insert({ ini_hash, want }).second) return true;
     }
     found->link_command_lists_and_filter_index(ini_hash);
     RebuildOverrideHashes();

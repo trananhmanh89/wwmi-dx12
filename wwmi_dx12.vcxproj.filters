@@ -241,6 +241,9 @@
     <ClCompile Include="reshade_addon\rabbitfx\rfx_patch.cpp">
       <Filter>rabbitfx</Filter>
     </ClCompile>
+    <ClCompile Include="reshade_addon\matcap\matcap_patch.cpp">
+      <Filter>rabbitfx</Filter>
+    </ClCompile>
     <ClCompile Include="reshade_addon\rabbitfx\rfx_patched_ps.cpp">
       <Filter>rabbitfx</Filter>
     </ClCompile>

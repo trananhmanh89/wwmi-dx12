@@ -19,6 +19,7 @@
 #include "crash_handler.h"
 #include "diag_gate.h"
 #include "../addon/addon.h"
+#include "../addon/home_dir.h"
 #include "../build_stamp.h" // WWMI_VERSION / WWMI_BUILD_SHA -- which build's map the offsets need
 #include "../core/log.h" // logger::utf8_locale -- the context is a wide section name
 
@@ -243,13 +244,10 @@ void InitReporting()
     InitializeCriticalSection(&g_cs);
     g_cs_ready = true;
     ResolveSelf();
-    wchar_t exe[MAX_PATH] = {};
-    if (GetModuleFileNameW(nullptr, exe, MAX_PATH)) {
-        wchar_t* slash = wcsrchr(exe, L'\\');
-        if (slash) {
-            *slash = 0;
-            _snwprintf_s(g_path, MAX_PATH, _TRUNCATE, L"%s\\wwmi_dx12_crash.log", exe);
-        }
+    // Portable build: the report goes next to the add-on, not into the game's folder.
+    const std::wstring home = AddonHomeDir();
+    if (!home.empty()) {
+        _snwprintf_s(g_path, MAX_PATH, _TRUNCATE, L"%swwmi_dx12_crash.log", home.c_str());
     }
 }
 

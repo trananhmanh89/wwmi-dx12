@@ -115,6 +115,8 @@ void RegisterShaderHash(uint64_t ini_hash);
 // and command lists are linked to it, as their regex match links them (filter_index for `ps == x`).
 bool LinkShaderRegexGroup(uint64_t ini_hash, const wchar_t* ns, const wchar_t* group);
 bool ShaderRegexLinked(uint64_t ini_hash);
+// Is this shader linked to that group in particular (a shader can stand for several groups)?
+bool ShaderRegexLinked(uint64_t ini_hash, const wchar_t* ns, const wchar_t* group);
 bool ShaderRegexGroupLoaded(const wchar_t* ns, const wchar_t* group);
 
 int DispatchTextureOverride(uint32_t texture_hash, DrawInfo* draw);

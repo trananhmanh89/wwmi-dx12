@@ -143,6 +143,7 @@ exit /b 0</Command>
     <ClCompile Include="reshade_addon\rabbitfx\pso_clone.cpp" />
     <ClCompile Include="reshade_addon\rabbitfx\pso_variant.cpp" />
     <ClCompile Include="reshade_addon\rabbitfx\rfx_patch.cpp" />
+    <ClCompile Include="reshade_addon\matcap\matcap_patch.cpp" />
     <ClCompile Include="reshade_addon\rabbitfx\rfx_patched_ps.cpp" />
     <ClCompile Include="reshade_addon\rabbitfx\rfx_shadow_heap.cpp" />
     <ClCompile Include="reshade_addon\rabbitfx\rfx_patch_srvs.cpp" />
@@ -310,6 +311,9 @@ string[] rfxFiles =
     @"reshade_addon\rfx_glow_ir.inc",
     @"reshade_addon\rabbitfx\rfx_patch.h",
     @"reshade_addon\rabbitfx\rfx_patch.cpp",
+    @"reshade_addon\matcap\matcap_dxil.inc",
+    @"reshade_addon\matcap\matcap_patch.h",
+    @"reshade_addon\matcap\matcap_patch.cpp",
 };
 var rfxBytes = new MemoryStream();
 foreach (string f in rfxFiles)

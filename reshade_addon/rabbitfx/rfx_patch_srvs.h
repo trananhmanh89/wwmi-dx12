@@ -13,6 +13,8 @@ class RfxPatchSrvs {
 public:
     bool NullSrvs(D3D12_CPU_DESCRIPTOR_HANDLE* null_tex, D3D12_CPU_DESCRIPTOR_HANDLE* null_buf);
     D3D12_CPU_DESCRIPTOR_HANDLE ParamsSrv(float hue, float sat, float val, float brightness);
+    // A params buffer of `texels` float4 (at most 16) from the same ring: the matcap patch's two texels.
+    D3D12_CPU_DESCRIPTOR_HANDLE ParamsSrvN(const float* values, unsigned texels);
 
 private:
     bool EnsureHeap();

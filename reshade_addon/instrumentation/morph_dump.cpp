@@ -11,6 +11,7 @@
 #include <windows.h>
 
 #include "../core/log.h"
+#include "../addon/home_dir.h"
 #include "../migoto/dx12_skcap.h" // SkCapArmFrames: J1's buffer contents
 
 namespace MorphDump {
@@ -51,9 +52,9 @@ std::atomic<bool> g_wait_instance{ false };
 
 std::wstring OutputDir()
 {
-    wchar_t buf[MAX_PATH] = {};
-    GetModuleFileNameW(nullptr, buf, MAX_PATH);
-    std::filesystem::path p(buf);
+    // Portable build: dumps go next to the add-on, not into the game's folder.
+    // AddonHomeDir() ends with a backslash, so parent_path() drops just that separator.
+    std::filesystem::path p(AddonHomeDir());
     return p.parent_path().wstring();
 }
 

@@ -118,7 +118,7 @@ static const char kRtBlockedText[] =
     "Turn ray tracing off in the game's graphics settings, then restart the game.";
 
 static const char kFaultedText[] = "The add-on hit an error and stopped: mods are OFF until the game restarts.\n"
-                                   "Please report it with wwmi_dx12_crash.log from the game's Win64 folder.";
+                                   "Please report it with wwmi_dx12_crash.log from the WWMI-DX12 folder (next to wwmi_dx12.addon64).";
 
 const char* OverlayPanel::StoppedText()
 {

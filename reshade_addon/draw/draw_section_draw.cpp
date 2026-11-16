@@ -30,6 +30,7 @@
 #include "../rabbitfx/pso_variant.h"
 #include "../rabbitfx/decensor_rest.h"
 #include "../rabbitfx/rfx_patch.h"
+#include "../matcap/matcap_patch.h"
 #include "../rabbitfx/rfx_patch_srvs.h"
 #include "../rabbitfx/rfx_toggles.h"
 #include "../textures/tex_toggles.h"
@@ -240,6 +241,18 @@ void SectionDrawIndexed(ComponentRun& run, uint32_t c, uint32_t s2, uint32_t b2)
             }
         }
     }
+    // The KatFXMatcap patch, over whatever shader this draw runs on: its PSO replaces the RabbitFX one, which it was
+    // built from when that is in use, and its descriptors ride the same shadow bind.
+    ID3D12PipelineState* mc_pso = nullptr;
+    if (!blend_pso && !layout_pso && !dc.full_shadow && draw_rt.rtv_count >= 4) {
+        const MatcapPlan mc_plan = MatcapPlanDraw(cmd_list, g_command_lists.Gfx(cmd_list).gfx_pso, rfxp_pso != nullptr,
+            rfx_censor, run.hk.srv_gen0, dm, wc ? (int)wc->index : -1);
+        if (mc_plan.pso) {
+            mc_pso = mc_plan.pso;
+            rfxp_binds.insert(rfxp_binds.end(), mc_plan.binds.begin(), mc_plan.binds.end());
+            if (!rfxp_restore) rfxp_restore = g_command_lists.Gfx(cmd_list).gfx_pso;
+        }
+    }
     RfxBindState tbind{};
     if (rfx_tex.d.ptr || rfx_tex.n.ptr || rfx_tex.l.ptr || rfx_tex.m.ptr) {
         PROF(PROF_DI_RfxDecide);
@@ -248,24 +261,26 @@ void SectionDrawIndexed(ComponentRun& run, uint32_t c, uint32_t s2, uint32_t b2)
         for (unsigned r = 0; r < 4; ++r)
             if (ps_regs.reads(r)) ps_reads |= (uint8_t)(1u << r);
         tbind = g_rfx_bind.DecideAndBind(cmd_list, d3d12_cl, dm, wc ? (int)wc->index : -1, rfx_tex.d, rfx_tex.n, rfx_tex.l,
-            rfx_tex.m, draw_rt.rtv_count >= 4, ps_reads, rfxp_pso ? &rfxp_binds : nullptr);
+            rfx_tex.m, draw_rt.rtv_count >= 4, ps_reads, (rfxp_pso || mc_pso) ? &rfxp_binds : nullptr);
     }
-    if (rfxp_pso) {
+    ID3D12PipelineState* const patch_pso = mc_pso ? mc_pso : rfxp_pso;
+    if (patch_pso) {
         if (!tbind.applied) tbind = g_rfx_bind.Apply(cmd_list, d3d12_cl, rfxp_binds, /*guard_bindless*/ false);
         const bool bound = tbind.applied;
         if (DiagOnce("RFXPATCH-DRAW",
                 (int)((((rfxp_restore ^ (rfxp_restore >> 32)) * 31u) + (uint64_t)(wc ? wc->index : 0)) & 0x7fffffff)))
-            logger::write("RFXPATCH draw mod=%d comp=%d pso=%llx rtv=%u -> variant %p, fx map %s, glow %s: %s", dm,
-                wc ? (int)wc->index : -1, (unsigned long long)rfxp_restore, draw_rt.rtv_count, (void*)rfxp_pso,
-                rfx_glow.fxmap.ptr ? "bound" : "null",
+            logger::write("RFXPATCH draw mod=%d comp=%d pso=%llx rtv=%u -> variant %p%s, fx map %s, glow %s: %s", dm,
+                wc ? (int)wc->index : -1, (unsigned long long)rfxp_restore, draw_rt.rtv_count, (void*)patch_pso,
+                mc_pso ? " (with the matcap)" : "", rfx_glow.fxmap.ptr ? "bound" : "null",
                 rfxp_glow ? "bound" : (rfx_glow.active ? "ARMED BUT NOT IN THIS VARIANT" : "null"),
                 bound ? "BOUND" : "NOT bindable (no param0 window: RABBITFX-BAIL above) -- drawn unpatched");
         if (bound) {
-            d3d12_cl->SetPipelineState(rfxp_pso);
+            d3d12_cl->SetPipelineState(patch_pso);
             ++g_rfx_stats.patch_draws;
             if (rfxp_glow) ++g_rfx_stats.glow_count;
         } else {
             rfxp_pso = nullptr;
+            mc_pso = nullptr;
             rfxp_glow = false;
             ++g_rfx_stats.patch_nobind;
         }
@@ -455,7 +470,7 @@ void SectionDrawIndexed(ComponentRun& run, uint32_t c, uint32_t s2, uint32_t b2)
         g_occl.End(d3d12_cl, oq);
     }
     if (tbind.bound) g_rfx_bind.Restore(d3d12_cl, tbind);
-    if (rfxp_pso && rfxp_restore) // the patched PS wrote the glow / cutout; back to the game's PSO
+    if ((rfxp_pso || mc_pso) && rfxp_restore) // the patched PS wrote the glow / cutout / matcap; back to the game's PSO
         d3d12_cl->SetPipelineState(reinterpret_cast<ID3D12PipelineState*>(g_command_lists.Gfx(cmd_list).gfx_restore()));
     if (layout_pso)
         d3d12_cl->SetPipelineState(reinterpret_cast<ID3D12PipelineState*>(g_command_lists.Gfx(cmd_list).gfx_restore()));

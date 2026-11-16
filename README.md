@@ -30,6 +30,9 @@ engine with the game in **DirectX 12**, on the WWMI folder and mods you already 
   one skeleton per copy
 - **Shape keys**
 - **RabbitFX**
+- **Matcap** - the KatFXMatcap mod (customoilfx): its matcap layers, masks and blend modes are blended into the
+  character's shader on the draws where the mod binds a matcap texture (needs the mod's `[ShaderRegex...Matcap]` section;
+  it works over Decensor and RabbitFX; first sight of a shader is prepared once and saved, like theirs)
 - **Decensor**
 - **Hide UID** - your player number hidden at the bottom right, in the Esc menu and in the Friends list
   (window option, off by default)
@@ -94,7 +97,7 @@ with a `wwmi-dx12` window showing "Active mods" above 0.
 
 - WWMI's own hotkeys and guides are not available
 - After adding or changing a mod, press F10 (or restart the game)
-- Decensor and RabbitFX mods prepare shaders on first sight (one-time stutter, saved for next launch)
+- Decensor, RabbitFX and matcap mods prepare shaders on first sight (one-time stutter, saved for next launch)
 
 ## Mod Installation
 

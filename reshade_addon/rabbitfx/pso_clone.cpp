@@ -1,6 +1,7 @@
 #include "pso_clone.h"
 #include "pso_variant.h"
 #include "rfx_patch.h"
+#include "../matcap/matcap_patch.h"
 #include "rfx_patched_ps.h"
 #include "../core/fnv.h"
 #include <cstdio>
@@ -289,6 +290,7 @@ void PsoCloneTable::Forget(reshade::api::device* dev, uint64_t pso_handle)
     std::vector<ID3D12PipelineState*> dead;
     g_pso_variants.ForgetSource(pso_handle, dead);
     g_rfx_patch.ForgetSource(pso_handle, dead);
+    g_matcap.ForgetSource(pso_handle, dead);
     for (ID3D12PipelineState* v : dead) {
         if (dev)
             dev->destroy_pipeline(reshade::api::pipeline{ reinterpret_cast<uint64_t>(v) });

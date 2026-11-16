@@ -2,6 +2,7 @@
 #include "../addon_common.h"
 #include "chain_trace.h"
 #include "../migoto/port_api.h"
+#include "../addon/home_dir.h"
 
 ChainTrace g_chain_trace;
 
@@ -10,18 +11,11 @@ static constexpr char kLF = 10;
 void ChainTrace::Open()
 {
     if (fp_) return;
-    wchar_t exe[MAX_PATH] = {};
     wchar_t path[MAX_PATH] = L"wwmi_dx12_chain_trace.log";
-    if (GetModuleFileNameW(nullptr, exe, MAX_PATH)) {
-        wchar_t* slash = wcsrchr(exe, L'\\');
-        if (slash) {
-            *slash = 0;
-            _snwprintf_s(path, MAX_PATH, _TRUNCATE,
-                L"%s"
-                L"\\"
-                L"wwmi_dx12_chain_trace.log",
-                exe);
-        }
+    // Portable build: the trace goes next to the add-on, not into the game's folder.
+    const std::wstring home = AddonHomeDir();
+    if (!home.empty()) {
+        _snwprintf_s(path, MAX_PATH, _TRUNCATE, L"%swwmi_dx12_chain_trace.log", home.c_str());
     }
     _wfopen_s(&fp_, path, L"w");
     if (!fp_) return;

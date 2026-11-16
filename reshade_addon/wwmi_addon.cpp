@@ -17,6 +17,7 @@
 #include "instrumentation/watchdogs.h"
 #include "instrumentation/debug_pipe.h"
 #include "rabbitfx/rfx_patch.h" // RfxPatchWorker::Stop
+#include "matcap/matcap_patch.h" // MatcapWorker::Stop
 #include "textures/tex_hooks.h"
 #include "textures/tex_look_worker.h"
 #include "textures/tex_look.h"
@@ -33,6 +34,7 @@
 #include "draw/draw_sectex.h"
 #include "present/present_log.h"
 #include "addon/addon.h"
+#include "addon/home_dir.h"
 #include "addon/debug_layer.h"
 #include "addon/settings.h"
 #include "build_stamp.h"
@@ -50,7 +52,8 @@
 
 extern HINSTANCE migoto_handle;
 
-static std::wstring s_win64; // the game exe's folder, with its trailing separator
+static std::wstring s_win64; // the game exe's folder, with its trailing separator; only for the game's own files
+static std::wstring s_home; // the add-on's folder (AddonHomeDir): our ini, logs, shaders and caches live here
 
 static void on_destroy_swapchain(swapchain*, bool resize)
 {
@@ -68,6 +71,7 @@ static void on_destroy_device(device*)
 {
     g_watchdogs.Stop();
     g_rfx_patch.Stop(); // it creates PSOs on this device
+    g_matcap.Stop(); // so does this one
     g_descriptors.UnwatchAll();
     g_tex_look_worker.Stop();
     g_tex_crawl.FlushIfQuiet(0);
@@ -220,7 +224,7 @@ static void SetupDirectories()
         wchar_t raw[MAX_PATH] = {};
         wcscpy_s(raw, g_settings.String(L"wwmi_dir").c_str());
         if (raw[0] && PathIsRelativeW(raw)) {
-            const std::wstring joined = s_win64 + raw;
+            const std::wstring joined = s_home + raw; // a relative wwmi_dir is relative to the add-on's folder
             if (!GetFullPathNameW(joined.c_str(), MAX_PATH, wwmi_dir_buf, nullptr)) wwmi_dir_buf[0] = 0;
         } else {
             wcscpy_s(wwmi_dir_buf, raw);
@@ -234,7 +238,7 @@ static void SetupDirectories()
         return;
     }
     MigotoPort::SetDumpDir((std::wstring(wwmi_dir_buf) + L"\\DX12_Dumps").c_str()); // every capture's root
-    g_addon.data_dir = s_win64 + L"wwmi_dx12";
+    g_addon.data_dir = s_home + L"wwmi_dx12";
     const std::wstring cache_dir = g_addon.data_dir + L"\\cache";
     CreateDirectoryW(g_addon.data_dir.c_str(), nullptr);
     CreateDirectoryW(cache_dir.c_str(), nullptr);
@@ -449,23 +453,23 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE)
     GetModuleFileNameW(addon_module, addon_path, MAX_PATH);
     wchar_t* p = wcsrchr(addon_path, L'\\');
     if (p) *p = L'\0';
-    // The ini and the log: next to the game exe (Win64), wherever ReShade loads add-ons from.
+    // The game exe's folder (Win64): only used to find the game's own Engine.ini and LocalStorage.db.
     wchar_t win64[MAX_PATH];
     GetModuleFileNameW(nullptr, win64, MAX_PATH);
     p = wcsrchr(win64, L'\\');
     if (p) *(p + 1) = L'\0';
     s_win64 = win64;
-    // Our shaders and dxc: wwmi_dx12\ next to the addon, else next to the game exe, else the addon's own dir.
+    // Portable build: the ini, the log and everything else we write sit next to the add-on, never in Win64.
+    s_home = std::wstring(addon_path) + L"\\";
+    // Our shaders and dxc: wwmi_dx12\ next to the add-on, else the add-on's own folder.
     g_addon.cso_dir = addon_path;
-    for (const std::wstring& d : { std::wstring(addon_path) + L"\\wwmi_dx12", s_win64 + L"wwmi_dx12" }) {
-        const DWORD a = GetFileAttributesW(d.c_str());
-        if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY)) {
-            g_addon.cso_dir = d;
-            break;
-        }
+    const std::wstring shader_dir = s_home + L"wwmi_dx12";
+    const DWORD shader_dir_attributes = GetFileAttributesW(shader_dir.c_str());
+    if (shader_dir_attributes != INVALID_FILE_ATTRIBUTES && (shader_dir_attributes & FILE_ATTRIBUTE_DIRECTORY)) {
+        g_addon.cso_dir = shader_dir;
     }
-    g_settings.Load(s_win64 + L"wwmi_dx12.ini");
-    ::logger::init((s_win64 + L"wwmi_dx12_addon.log").c_str());
+    g_settings.Load(s_home + L"wwmi_dx12.ini");
+    ::logger::init((s_home + L"wwmi_dx12_addon.log").c_str());
     ::logger::set_build_id(WWMI_VERSION " " WWMI_BUILD_SHA); // emitted the moment the level is raised above 0
 
     const int dred_armed = ArmDred();
@@ -515,6 +519,7 @@ extern "C" __declspec(dllexport) void AddonUninit(HMODULE addon_module, HMODULE)
     g_watchdogs.Stop(); // no thread of this DLL may outlive its mapping
     DebugPipe::Shutdown();
     g_rfx_patch.Stop();
+    g_matcap.Stop();
     g_descriptors.UnwatchAll(); // a live heap's release must not call into this DLL once it is unmapped
     g_tex_look_worker.Stop();
     g_tex_crawl.FlushIfQuiet(0);
