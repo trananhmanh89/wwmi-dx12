@@ -1687,6 +1687,81 @@ void ReadyModBufferForSkin(ID3D12GraphicsCommandList* cl, ID3D12Resource* res)
             cl, res, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 }
 
+// Debug only (SKINDUMP): each component's whole skinned position buffer, copied in one chosen frame per mod and
+// saved to wwmi_dx12\rt_dump some frames later, so the components can be compared with each other offline.
+struct SkinDump {
+    Microsoft::WRL::ComPtr<ID3D12Resource> buffer; // readback copy of the positions
+    const uint8_t* data = nullptr;
+    uint32_t bytes = 0;
+    bool written = false;
+};
+constexpr uint32_t kSkinDumpDelayFrames = 600; // after the mod is first skinned
+std::map<int, SkinDump> s_skin_dumps;          // by mod * 256 + component
+std::map<int, uint32_t> s_skin_dump_frame;     // by mod: the frame its components are copied in
+
+/**
+ * Debug only: records a copy of a component's skinned positions when this is its mod's dump frame.
+ * Call with s_gpu.mutex held and the positions readable as a copy source.
+ *
+ * @param device    The device, to make the readback buffer.
+ * @param d3d12_cl  The command list the copy is recorded on.
+ * @param dm        The mod.
+ * @param key       mod * 256 + component.
+ * @param positions The skinned positions (float3 per vertex).
+ * @param vertices  How many vertices they hold.
+ * @return true when a copy was recorded.
+ */
+bool RecordSkinDump(ID3D12Device* device, ID3D12GraphicsCommandList* d3d12_cl, int dm, int key,
+    ID3D12Resource* positions, uint32_t vertices)
+{
+    const auto frame_found = s_skin_dump_frame.find(dm);
+    if (frame_found == s_skin_dump_frame.end()) {
+        s_skin_dump_frame[dm] = g_frame_id + kSkinDumpDelayFrames;
+        return false;
+    }
+    if (g_frame_id != frame_found->second) return false;
+    SkinDump& dump = s_skin_dumps[key];
+    if (dump.buffer) return false;
+    dump.bytes = vertices * kModPositionStride;
+    dump.buffer = WwmiMakeBuffer(device, dump.bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE,
+        D3D12_RESOURCE_STATE_COPY_DEST);
+    void* mapped = nullptr;
+    if (!dump.buffer || FAILED(dump.buffer->Map(0, nullptr, &mapped))) return false;
+    dump.data = static_cast<const uint8_t*>(mapped);
+    d3d12_cl->CopyBufferRegion(dump.buffer.Get(), 0, positions, 0, dump.bytes);
+    return true;
+}
+
+/**
+ * Debug only: saves the copies RecordSkinDump made, once the GPU is surely done with them (10 frames later),
+ * as wwmi_dx12\rt_dump\skin_mod<mod>_comp<component>.bin. Call with s_gpu.mutex held.
+ */
+void WriteSkinDumps()
+{
+    for (auto& entry : s_skin_dumps) {
+        SkinDump& dump = entry.second;
+        if (dump.written || !dump.data) continue;
+        const int dm = entry.first / 256;
+        const auto frame_found = s_skin_dump_frame.find(dm);
+        if (frame_found == s_skin_dump_frame.end() || g_frame_id < frame_found->second + 10) continue;
+        dump.written = true;
+        const std::wstring folder = AddonHomeDir() + L"wwmi_dx12\\rt_dump\\";
+        CreateDirectoryW((AddonHomeDir() + L"wwmi_dx12").c_str(), nullptr);
+        CreateDirectoryW(folder.c_str(), nullptr);
+        wchar_t name[64];
+        swprintf_s(name, L"skin_mod%d_comp%d.bin", dm, entry.first % 256);
+        const HANDLE file = CreateFileW((folder + name).c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL, nullptr);
+        DWORD written = 0;
+        if (file != INVALID_HANDLE_VALUE) {
+            WriteFile(file, dump.data, dump.bytes, &written, nullptr);
+            CloseHandle(file);
+        }
+        logger::write("SKINDUMP mod=%d comp=%d: %u of %u bytes of skinned positions of frame %u saved", dm,
+            entry.first % 256, (uint32_t)written, dump.bytes, frame_found->second);
+    }
+}
+
 /**
  * Debug only: logs the readback recorded by SkinDraw once the GPU is surely done with it (10 frames later):
  * the first two bones of the palette and the first four skinned positions. Call with s_gpu.mutex held.
@@ -1739,14 +1814,29 @@ VfRestore CannotSkin()
 }
 
 VfRestore RtDrawPass::SkinDraw(reshade::api::command_list* cmd_list, ID3D12GraphicsCommandList* d3d12_cl, int dm,
-    const WwmiMod::Component* wc, uint32_t, uint32_t, uint32_t, uint32_t, int32_t vertex_offset, uint64_t, uint64_t, int,
-    bool)
+    const WwmiMod::Component* wc, uint32_t, uint32_t, uint32_t first_index, uint32_t index_count, int32_t vertex_offset,
+    uint64_t vs_hash, uint64_t, int, bool)
 {
     if (!wc || !d3d12_cl || dm < 0) return {};
     const CmdState& state = g_command_lists.Gfx(cmd_list);
     if (!IsPassThroughPso(state.gfx_pso)) return {};
     const int comp = wc->index;
     const int once_key = dm * 256 + (comp & 0xFF); // the mod and component, for the log and the output buffers
+    if (g_debug) { // which vertex shaders draw each component (PTSKIN-VS), once per component and shader
+        static std::mutex s_vs_seen_mutex;
+        static std::set<std::pair<int, uint64_t>> s_vs_seen;
+        bool is_new = false;
+        {
+            std::lock_guard<std::mutex> lock(s_vs_seen_mutex);
+            is_new = s_vs_seen.size() < 400 && s_vs_seen.insert({ once_key, vs_hash }).second;
+        }
+        if (is_new)
+            logger::write("PTSKIN-VS mod=%d comp=%d vs=%016llx pso=%llx first_index=%u index_count=%u frame=%u", dm,
+                comp, (unsigned long long)vs_hash, (unsigned long long)state.gfx_pso, first_index, index_count,
+                g_frame_id);
+    }
+    // Debug (ptskin_test = 5): component 3 is not drawn, to see what is left without it.
+    if (g_settings.ptskin_test == 5 && comp == 3) return CannotSkin();
 
     const MigotoPort::PipeState& port = MigotoPort::State();
     const MigotoPort::ShimVbRecord& positions = port.shim_vb[0];
@@ -1989,6 +2079,14 @@ VfRestore RtDrawPass::SkinDraw(reshade::api::command_list* cmd_list, ID3D12Graph
             s_gpu.readback_slot_frame = current_frame;
         }
     }
+    if (g_debug) {
+        WriteSkinDumps();
+        const auto dump_frame = s_skin_dump_frame.find(dm);
+        if (dump_frame == s_skin_dump_frame.end() || dump_frame->second == g_frame_id) {
+            Xit(d3d12_cl, gen, outputs->positions, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            RecordSkinDump(device.Get(), d3d12_cl, dm, once_key, outputs->positions.res.Get(), vertices);
+        }
+    }
     Xit(d3d12_cl, gen, outputs->positions, kDrawReadState);
     if (has_previous) Xit(d3d12_cl, gen, outputs->previous_positions, kDrawReadState);
     if (current_slot) Xit(d3d12_cl, gen, *current_slot, D3D12_RESOURCE_STATE_COMMON);
@@ -2155,8 +2253,7 @@ VfRestore RtDrawPass::StampVertexFetch(reshade::api::command_list* cmd_list, ID3
     int32_t local_vf[8] = {};
     const RegBind& cb = cbs[2];
     bool cb_copied = false;
-    if (!slots.empty() && cb.param < 64 && !cb.is_table && state.root[cb.param].va &&
-        g_game_cbs.ReadRootCbv(cmd_list, cb.param, local_vf, 24)) {
+    if (!slots.empty() && cb.param < 64 && !cb.is_table && g_game_cbs.ReadRootCbv(cmd_list, cb.param, local_vf, 24)) {
         int32_t ours[8];
         memcpy(ours, local_vf, sizeof(ours));
         ours[1] = 4; // the mod's vb2 holds four UV sets per vertex
@@ -2169,10 +2266,39 @@ VfRestore RtDrawPass::StampVertexFetch(reshade::api::command_list* cmd_list, ID3
                 memcpy(slot, ours, 24);
                 cl->SetGraphicsRootConstantBufferView(cb.param, va);
                 restore.param = cb.param;
-                restore.va = state.root[cb.param].va;
+                restore.va = g_command_lists.Cbv(cmd_list).binds[cb.param].va;
                 cb_copied = true;
             }
         }
+    }
+    if (log && g_debug) {
+        // Debug (PTSKIN-MAT): the game's material constants of this draw (vs-b4), saved to study the vertex
+        // offset the game's vertex shader takes from them.
+        const RegBind& material = cbs[4];
+        uint8_t bytes[3072] = {};
+        RootCbvBind material_bind;
+        if (material.param < 64 && !material.is_table) material_bind = g_command_lists.Cbv(cmd_list).binds[material.param];
+        const uint32_t material_read = material_bind.res
+            ? g_game_cbs.Snapshot(material_bind.res, material_bind.va, bytes, sizeof(bytes), true) : 0;
+        const bool readable = material_read > 0;
+        uint32_t non_zero = 0;
+        for (size_t i = 0; i < sizeof(bytes); ++i) non_zero += bytes[i] != 0;
+        if (readable) {
+            const std::wstring folder = AddonHomeDir() + L"wwmi_dx12\\rt_dump\\";
+            wchar_t name[80];
+            swprintf_s(name, L"mat_mod%d_comp%d_pso%llx.bin", dm, comp, (unsigned long long)state.gfx_pso);
+            const HANDLE file = CreateFileW((folder + name).c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (file != INVALID_HANDLE_VALUE) {
+                DWORD written = 0;
+                WriteFile(file, bytes, sizeof(bytes), &written, nullptr);
+                CloseHandle(file);
+            }
+        }
+        logger::write("PTSKIN-MAT mod=%d comp=%d pso=%llx: vs-b4 root %u%s va %llx -> %s, %u non-zero bytes", dm, comp,
+            (unsigned long long)state.gfx_pso, (unsigned)material.param, material.is_table ? " (in a table)" : "",
+            (unsigned long long)material_bind.va,
+            readable ? "read and saved" : "not readable", non_zero);
     }
     if (log)
         logger::write("PTSKIN-FETCH mod=%d comp=%d pso=%llx:%s | LocalVF (root %u%s) = %d %d %d %d %d %d -> %s", dm, comp,
@@ -2262,8 +2388,13 @@ bool LooksLikeSkinCacheShader(const void* code, size_t code_size)
 void RtNoteComputeShader(uint64_t cs_hash, const void* code, size_t code_size)
 {
     if (!code || code_size == 0) return;
-    if (!LooksLikeSkinCacheShader(code, code_size)) return;
-    NoteSkinCbLayout(cs_hash, code, code_size);
+    const bool skin_cache = LooksLikeSkinCacheShader(code, code_size);
+    // Debug: also saved for study -- the shader that runs only with ray tracing on (the morphs?), and any shader
+    // whose bytecode names morphs.
+    const std::string_view bytes(static_cast<const char*>(code), code_size);
+    const bool studied = cs_hash == 0xa7155a3e69aaafbfull || bytes.find("Morph") != std::string_view::npos;
+    if (!skin_cache && !studied) return;
+    if (skin_cache) NoteSkinCbLayout(cs_hash, code, code_size);
     if (!g_debug) return;
     if (s_cs_dumped.fetch_add(1, std::memory_order_relaxed) >= kCsDumpCap) return;
 
@@ -2312,7 +2443,7 @@ void RtNoteGraphicsPipeline(uint64_t pso, uint64_t vs_hash, const void* vs_code,
     static std::set<uint64_t> s_saved;
     {
         std::lock_guard lock(s_mutex);
-        if (s_saved.size() >= 32 || !s_saved.insert(vs_hash).second) return;
+        if (s_saved.size() >= 1000 || !s_saved.insert(vs_hash).second) return;
     }
     const std::wstring folder = AddonHomeDir() + L"wwmi_dx12\\rt_dump\\";
     CreateDirectoryW((AddonHomeDir() + L"wwmi_dx12").c_str(), nullptr);

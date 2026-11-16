@@ -58,11 +58,18 @@ static void LogMorphWeights(command_list* cmd_list, uint32_t group_count_y)
     const uint64_t layout = g_command_lists.CmpLayout(cmd_list);
     const int root = layout ? g_layouts.CsCb0Root(layout) : -1;
     if (root < 0 || root >= 64) return;
-    const CmdState& state = g_command_lists.Gfx(cmd_list);
+    const auto& constant_buffers = g_command_lists.Cbv(cmd_list);
+    ID3D12Resource* const res = reinterpret_cast<ID3D12Resource*>(constant_buffers.binds[root].res);
+    const uint64_t va = constant_buffers.binds[root].va;
     uint32_t cb0[66 * 4] = {};
-    const uint32_t got = g_game_cbs.Snapshot(state.root[root].res, state.root[root].va,
-        reinterpret_cast<uint8_t*>(cb0), sizeof(cb0), true);
-    if (got < sizeof(cb0)) return;
+    const uint32_t got = (res && va) ? g_game_cbs.Snapshot(res, va, reinterpret_cast<uint8_t*>(cb0), sizeof(cb0), true) : 0;
+    if (got < sizeof(cb0)) {
+        static std::atomic<int> s_failures{ 0 };
+        if (s_failures.fetch_add(1) < 4)
+            logger::write("MORPHWEIGHTS: cb0 not readable (root %d, res %p, va %llx, %u bytes read)", root, (void*)res,
+                (unsigned long long)va, got);
+        return;
+    }
     const uint32_t checksum = cb0[0] + cb0[1] + cb0[2] + cb0[3];
     uint64_t weights_hash = 14695981039346656037ull;
     std::string weights;
@@ -77,14 +84,21 @@ static void LogMorphWeights(command_list* cmd_list, uint32_t group_count_y)
         weights += part;
     }
     static std::mutex s_mutex;
-    static std::map<uint64_t, uint64_t> s_last; // (checksum, group count) -> the weights logged last
-    static int s_lines = 0;
+    struct Logged {
+        uint64_t weights_hash = 0;
+        uint32_t frame = 0;
+        int lines = 0;
+    };
+    static std::map<uint64_t, Logged> s_last; // (checksum, group count) -> what was logged last
     std::lock_guard<std::mutex> lock(s_mutex);
     const uint64_t key = ((uint64_t)checksum << 32) | group_count_y;
-    const auto found = s_last.find(key);
-    if (found != s_last.end() && found->second == weights_hash) return;
-    s_last[key] = weights_hash;
-    if (s_lines++ >= 300) return;
+    Logged& logged = s_last[key];
+    if (logged.lines && logged.weights_hash == weights_hash) return;
+    // Per mesh: the first two sets, then one every 120 frames, 12 lines at most.
+    if (logged.lines >= 12 || (logged.lines >= 2 && g_frame_id - logged.frame < 120)) return;
+    logged.weights_hash = weights_hash;
+    logged.frame = g_frame_id;
+    logged.lines += 1;
     logger::write("MORPHWEIGHTS checksum=%u groups_y=%u frame=%u: non-zero weights:%s", checksum, group_count_y,
         g_frame_id, weights.empty() ? " none" : weights.c_str());
 }
