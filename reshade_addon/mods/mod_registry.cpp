@@ -99,13 +99,16 @@ void ModRegistry::Build()
             GeoMod& gm = units_.back();
             const int mod_id = (int)units_.size() - 1;
             gm.wcl_ns = groups[oi].ns; // their namespace for this unit's inis, asked once above
-            if (WwmiMod::ReadMod(gm.wcl_ns, by_ns, gm.mod) <= 0 || gm.mod.comps.empty()) {
+            const int comp_count = WwmiMod::ReadMod(gm.wcl_ns, by_ns, gm.mod);
+            // A library without components (e.g. a shared textures.ini run from a mod's sections) may still ask
+            // what the game bound in ps-tN, so note that before dropping it.
+            if (gm.mod.queries_ps_slots) ps_slot_queries_.store(true, std::memory_order_relaxed);
+            if (comp_count <= 0 || gm.mod.comps.empty()) {
                 units_.pop_back();
                 continue;
             }
             if (gm.mod.dir.empty()) gm.mod.dir = dm.dir; // only if their SectionFolder had none
             WwmiMod::LoadResources(gm.mod, CurrentSet().held);
-            if (gm.mod.queries_ps_slots) ps_slot_queries_.store(true, std::memory_order_relaxed);
             if (!gm.mod.forward_map_file.empty()) {
                 std::wstring rel = gm.mod.forward_map_file;
                 for (auto& c : rel)

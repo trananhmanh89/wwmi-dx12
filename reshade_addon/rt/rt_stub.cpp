@@ -57,3 +57,7 @@ bool RtModulePresent()
 {
     return false;
 }
+void RtNoteComputeShader(uint64_t, const void*, size_t) {}
+void RtNoteGraphicsPipeline(uint64_t, uint64_t, const void*, size_t) {}
+void RtNoteComponentDraw(int, ID3D12Resource*, uint64_t, uint32_t, uint32_t, uint32_t, bool, const RtDrawnRange*, uint32_t) {}
+void RtNoteDispatchRays(ID3D12Resource*, uint64_t, uint64_t, uint64_t, uint32_t, uint32_t) {}

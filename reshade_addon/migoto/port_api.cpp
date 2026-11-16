@@ -310,6 +310,9 @@ static void RunConstantsOnce()
     g_constants_generation = g_generation;
 
     RunCommandList(&g_dev, &g_ctx, &G->constants_command_list, nullptr, false);
+    // WWMI's first-run guide is dismissed with F10, which this port gates off. [Constants] just put back the
+    // saved $first_run, and [Present] would open the guide this very frame, so clear it here.
+    if (GetVarNs(L"WWMIv1", L"first_run", 0.f) != 0.f) SetVarNs(L"WWMIv1", L"first_run", 0.f);
     G->user_config_dirty = false;
     RunCommandList(&g_dev, &g_ctx, &G->post_constants_command_list, nullptr, true);
 

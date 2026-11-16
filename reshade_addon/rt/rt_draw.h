@@ -11,6 +11,8 @@
 struct VfRestore {
     uint8_t param = 0xFF;
     uint64_t va = 0;
+    bool skip = false; // the mod could not be skinned for this draw: draw nothing
+    bool fetch = false; // extra shadow slots were queued: the draw needs a shadow bind even with nothing else to bind
 };
 struct RtPalResult {
     bool tried = false;

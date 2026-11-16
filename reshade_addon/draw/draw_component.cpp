@@ -14,6 +14,7 @@
 #include "../mods/shader_alias.h"
 #include "../hooks/pipeline_registry.h"
 #include "../rt/rt_draw.h"
+#include "../rt/rt_hooks.h" // RtNoteComponentDraw
 #include "draw_context.h"
 #include "draw_inject.h"
 #include "draw_sectex.h"
@@ -587,7 +588,11 @@ bool DrawComponent(DrawContext& ctx, int dm, const WwmiMod::Component* wc)
     ComponentRun run(ctx, dm, wc);
     run.hk.handling_skip = [&skip_orig] { skip_orig = true; };
     InstallRfxHooks(run);
-    run.hk.drawindexed = [&run](uint32_t c, uint32_t s2, uint32_t b2) { SectionDrawIndexed(run, c, s2, b2); };
+    std::vector<RtDrawnRange> drawn; // for the RT module: what the section drew
+    run.hk.drawindexed = [&run, &drawn](uint32_t c, uint32_t s2, uint32_t b2) {
+        drawn.push_back(RtDrawnRange{ c, s2 });
+        SectionDrawIndexed(run, c, s2, b2);
+    };
     {
         static std::atomic<bool> once{ false };
         if (!once.exchange(true))
@@ -661,6 +666,11 @@ bool DrawComponent(DrawContext& ctx, int dm, const WwmiMod::Component* wc)
         ran = PortRunSection(fq, run.hk, da.index_count, da.first_index, da.first_instance,
             g_command_lists.Gfx(cmd_list).gfx_pso, skip_orig);
         t_trace_binds = false;
+        if (ran) {
+            const IndexBind& game_ib = g_command_lists.Gfx(cmd_list).ib;
+            RtNoteComponentDraw(dm, game_ib.res, game_ib.va, game_ib.size, da.first_index, da.index_count, skip_orig, drawn.data(),
+                (uint32_t)drawn.size());
+        }
     }
     for (unsigned r = 0; r < kSectionTexRegs; ++r)
         if (sect_tex & (1u << r)) PortApi::UnpushGameTexture('p', r);

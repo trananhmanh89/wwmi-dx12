@@ -626,6 +626,8 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE)
     if (g_settings.dx12_debug_layer) EnableDebugLayer();
     ::logger::write("Config: debug=%d (diagnostics %s, log level %d)", (int)g_debug, g_debug ? "ON" : "off",
         g_debug ? g_log_verbosity : 0);
+    if (g_settings.rt_experimental)
+        ::logger::write("Config: rt_experimental=1 -- the mods stay on if the game ray traces (no RT module)");
 
     ApplyEngineCvars();
 

@@ -182,7 +182,9 @@ uint16_t SectionTexturePublisher::Publish(command_list* cmd_list, int dm, int co
     uint64_t ps_hash = 0;
     cmd_list->get_private_data(s_iid_ps_hash, &ps_hash);
     const uint64_t pass = TexLookPlaceOf(Mods().At(dm).wcl_ns.c_str(), comp, ps_hash);
-    const bool every_slot = Mods().At(dm).mod.queries_ps_slots;
+    // Every read slot is published when any loaded ini asks about ps-tN: the question may sit in a library the
+    // mod runs (e.g. `run = CommandList\HsinThiccTextures\SetTextures`), not in the mod's own file.
+    const bool every_slot = Mods().At(dm).mod.queries_ps_slots || Mods().PsSlotQueries();
     device* dev = cmd_list->get_device();
     ForEachPsTexture(
         cmd_list, g_debug, ps_regs, [](unsigned) { return true; },
