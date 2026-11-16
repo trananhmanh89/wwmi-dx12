@@ -35,6 +35,9 @@
 #include "../addon/settings.h"     // g_settings.ptskin_test
 #include "../core/dxil_cb.h"
 #include "../migoto/dx12_pipeline.h"     // MigotoPort::State, OwnedTransition
+#include "../migoto/dx12_context_impl.h" // MigotoPort::ShimBufferForCompute: the skeleton a mod binds
+#include "../migoto/port_api.h"          // PortApi::PushGameConstantBuffer
+#include "../mods/port_section.h"        // kDx11SkeletonCbByteWidth
 #include "../migoto/dx12_input_layout.h" // MigotoPort::DescribeInputLayout
 #include "pt_skin_owned.h"               // Owned, Xit
 #include "rt_hooks.h"
@@ -1007,6 +1010,8 @@ constexpr D3D12_RESOURCE_STATES kDrawReadState =
     D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 constexpr uint32_t kBoneBytes = 48;         // 3 float4 rows
 constexpr uint32_t kPtSkinMaxBones = 256;         // indices are 8-bit
+// A palette copy's buffer: as big as the DX11 skeleton constant buffer a mod's merge commands read it as.
+constexpr uint32_t kPaletteBufferBytes = 16384;
 
 std::mutex s_skin_cb_mutex;
 std::unordered_map<uint64_t, SkinCbLayout> s_skin_cb; // by compute shader hash
@@ -1447,6 +1452,8 @@ struct PtSkinGpu {
     int readback_done = 0;
     int readback_key = 0;
     uint32_t readback_slot_frame = 0;
+    uint32_t readback_first_bone = 0;    // the first of the two bones read from the skeleton skinned with
+    uint32_t readback_palette_frame = 0; // the frame of the section palette read with it; 0 = none
     uint32_t readback_vertices = 0;
     std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> retired; // outgrown buffers a list in flight may still read
 };
@@ -1631,7 +1638,7 @@ void CopySectionPalette(reshade::api::command_list* cmd_list, const CmdState& st
     if (!EnsurePtSkinPipeline(device.Get())) return;
     PtSkinGpu::Palette& palette = s_gpu.palettes[{ mod, PaletteKey(section) }];
     if (!palette.slot[0].res) {
-        const UINT64 size = (UINT64)kPtSkinMaxBones * kBoneBytes;
+        const UINT64 size = kPaletteBufferBytes;
         for (int i = 0; i < PtSkinGpu::kSlots; ++i) {
             palette.slot[i].res = WwmiMakeBuffer(device.Get(), size, D3D12_HEAP_TYPE_DEFAULT,
                 D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
@@ -1687,7 +1694,7 @@ void ReadyModBufferForSkin(ID3D12GraphicsCommandList* cl, ID3D12Resource* res)
 void LogPtSkinReadback()
 {
     if (!s_gpu.readback_frame || g_frame_id < s_gpu.readback_frame + 10) return;
-    float values[24 + 48];
+    float values[24 + 48 + 24];
     memcpy(values, s_gpu.readback_data, sizeof(values));
     std::string samples;
     for (uint32_t i = 0; i < 16; ++i) {
@@ -1703,9 +1710,17 @@ void LogPtSkinReadback()
         values[0], values[1], values[2], values[3], values[4], values[5], values[6], values[7], values[8], values[9],
         values[10], values[11], values[12], values[13], values[14], values[15], values[16], values[17], values[18],
         values[19], values[20], values[21], values[22], values[23], samples.c_str());
+    // Where the two bones are (the last column of their rows): the skeleton skinned with, and the game's section
+    // palette of the same moment. A part that stands still shows here as bones that do not change.
+    logger::write("PTSKIN-BONES mod=%d comp=%d frame=%u: skinned with bones %u and %u at (%.2f %.2f %.2f) (%.2f %.2f "
+                  "%.2f); section palette of frame %u: bones 0 and 1 at (%.2f %.2f %.2f) (%.2f %.2f %.2f)",
+        s_gpu.readback_key / 256, s_gpu.readback_key % 256, s_gpu.readback_frame, s_gpu.readback_first_bone,
+        s_gpu.readback_first_bone + 1, values[3], values[7], values[11], values[15], values[19], values[23],
+        s_gpu.readback_palette_frame, values[72 + 3], values[72 + 7], values[72 + 11], values[72 + 15],
+        values[72 + 19], values[72 + 23]);
     s_gpu.readback_frame = 0;
     s_gpu.readback_done += 1;
-    s_gpu.readback_next_frame = g_frame_id + 30;
+    s_gpu.readback_next_frame = g_frame_id + 2;
 }
 
 } // namespace
@@ -1792,51 +1807,90 @@ VfRestore RtDrawPass::SkinDraw(reshade::api::command_list* cmd_list, ID3D12Graph
     if (FAILED(d3d12_cl->GetDevice(IID_PPV_ARGS(&device)))) return {};
     std::lock_guard lock(s_gpu.mutex);
     if (!EnsurePtSkinPipeline(device.Get())) return {};
-    // The section's palette as copied at the game's skin dispatch: on the GPU, that of the frame being drawn.
-    const auto palette_found = s_gpu.palettes.find({ dm, PaletteKey(section) });
-    if (palette_found == s_gpu.palettes.end()) {
-        s_ptskin_skipped.fetch_add(1, std::memory_order_relaxed);
-        if (LogOnce(13, once_key))
-            logger::write("PTSKIN mod=%d comp=%d: no copy of the section's bone palette yet", dm, comp);
-        return CannotSkin();
-    }
-    PtSkinGpu::Palette& palette = palette_found->second;
-    // This frame's slot, else the newest one; the previous palette is the newest slot older than that.
+    // The bones to skin with. A mod that keeps the game's skeletons apart uses its section's palette, as copied
+    // at the game's skin dispatch. A mod that merges them numbers its bones over the merged skeleton, which its
+    // own commands build (from the palettes PalPublish hands them) and bind at vs-cb4.
+    const bool merged_skeleton = wc->vg_count > 0;
+    uint64_t bones_va = 0;
+    uint32_t bone_count = 0;
+    Owned* current_slot = nullptr; // the palette copy the bones are in; none for a merged skeleton
+    Owned* previous_slot = nullptr;
+    uint32_t previous_bone_count = 0;
     int current_index = -1;
     int previous_index = -1;
-    for (int i = 0; i < PtSkinGpu::kSlots; ++i) {
-        if (palette.bytes[i] == 0 || palette.frame[i] > g_frame_id) continue;
-        if (current_index < 0 || palette.frame[i] > palette.frame[current_index]) current_index = i;
+    uint32_t current_frame = 0;
+    uint32_t previous_frame = 0;
+    MigotoPort::ShimBufView skeleton; // the mod's merged skeleton, when that is what the bones come from
+    if (merged_skeleton) {
+        const char* why = nullptr;
+        void* bound = MigotoPort::AcquireShimVsCb(4);
+        const bool is_the_mods = bound && !MigotoPort::ShimObjectForeign(bound);
+        MigotoPort::ReleaseShimObject(bound);
+        if (!is_the_mods || !MigotoPort::ShimBufferForCompute(d3d12_cl, 'c', 4, &skeleton, &why) || !skeleton.va) {
+            s_ptskin_skipped.fetch_add(1, std::memory_order_relaxed);
+            static std::atomic<int> s_no_skeleton_logs{ 0 };
+            if (g_debug && s_no_skeleton_logs.fetch_add(1) < 40)
+                logger::write("PTSKIN-MERGED mod=%d comp=%d frame=%u: the mod bound no merged skeleton at vs-cb4 "
+                              "(%s) -- not drawn",
+                    dm, comp, g_frame_id,
+                    !bound ? "nothing there" : !is_the_mods ? "the game's buffer" : why ? why : "?");
+            return CannotSkin();
+        }
+        bones_va = skeleton.va;
+        bone_count = skeleton.size / kBoneBytes;
+        if (LogOnce(16, once_key))
+            logger::write("PTSKIN-MERGED mod=%d comp=%d: skinned with the skeleton the mod binds at vs-cb4 (%llx, %u "
+                          "bytes, %u bones; vg_offset %u, vg_count %u, remap %d)",
+                dm, comp, (unsigned long long)skeleton.va, skeleton.size, bone_count, wc->vg_offset, wc->vg_count,
+                wc->remap_id);
+    } else {
+        const auto palette_found = s_gpu.palettes.find({ dm, PaletteKey(section) });
+        if (palette_found == s_gpu.palettes.end()) {
+            s_ptskin_skipped.fetch_add(1, std::memory_order_relaxed);
+            if (LogOnce(13, once_key))
+                logger::write("PTSKIN mod=%d comp=%d: no copy of the section's bone palette yet", dm, comp);
+            return CannotSkin();
+        }
+        PtSkinGpu::Palette& palette = palette_found->second;
+        // This frame's slot, else the newest one; the previous palette is the newest slot older than that.
+        for (int i = 0; i < PtSkinGpu::kSlots; ++i) {
+            if (palette.bytes[i] == 0 || palette.frame[i] > g_frame_id) continue;
+            if (current_index < 0 || palette.frame[i] > palette.frame[current_index]) current_index = i;
+        }
+        if (current_index < 0) {
+            s_ptskin_skipped.fetch_add(1, std::memory_order_relaxed);
+            if (LogOnce(13, once_key))
+                logger::write("PTSKIN mod=%d comp=%d: no copy of the section's bone palette yet", dm, comp);
+            return CannotSkin();
+        }
+        for (int i = 0; i < PtSkinGpu::kSlots; ++i) {
+            if (palette.bytes[i] == 0 || palette.frame[i] >= palette.frame[current_index]) continue;
+            if (previous_index < 0 || palette.frame[i] > palette.frame[previous_index]) previous_index = i;
+        }
+        current_slot = &palette.slot[current_index];
+        bones_va = current_slot->va();
+        bone_count = palette.bytes[current_index] / kBoneBytes;
+        current_frame = palette.frame[current_index];
+        // The previous palette gives the positions motion vectors are made from; without it, no motion.
+        if (previous_index >= 0 && g_settings.ptskin_test != 1) {
+            previous_slot = &palette.slot[previous_index];
+            previous_bone_count = palette.bytes[previous_index] / kBoneBytes;
+            previous_frame = palette.frame[previous_index];
+        }
     }
-    if (current_index < 0) {
-        s_ptskin_skipped.fetch_add(1, std::memory_order_relaxed);
-        if (LogOnce(13, once_key))
-            logger::write("PTSKIN mod=%d comp=%d: no copy of the section's bone palette yet", dm, comp);
-        return CannotSkin();
-    }
-    for (int i = 0; i < PtSkinGpu::kSlots; ++i) {
-        if (palette.bytes[i] == 0 || palette.frame[i] >= palette.frame[current_index]) continue;
-        if (previous_index < 0 || palette.frame[i] > palette.frame[previous_index]) previous_index = i;
-    }
-    Owned& current_slot = palette.slot[current_index];
-    const uint32_t bone_count = palette.bytes[current_index] / kBoneBytes;
-    // The previous palette gives the positions motion vectors are made from; without it, no motion.
-    const bool has_previous = previous_index >= 0 && g_settings.ptskin_test != 1;
-    const uint32_t previous_bone_count = has_previous ? palette.bytes[previous_index] / kBoneBytes : 0;
-    Owned& previous_slot = has_previous ? palette.slot[previous_index] : current_slot;
+    const bool has_previous = previous_slot != nullptr;
     static std::atomic<int> s_trace_draws{ 0 };
     if (g_debug && comp == 0 && s_trace_draws.fetch_add(1) < 64)
         logger::write("PTSKIN-TRACE draw mod=%d comp=%d frame=%u out=%llx slot=%d (frame %u) previous=%d (frame %u) "
                       "pso=%llx list_type=%d",
-            dm, comp, g_frame_id, (unsigned long long)section.out_va, current_index, palette.frame[current_index],
-            previous_index, has_previous ? palette.frame[previous_index] : 0, (unsigned long long)state.gfx_pso,
-            (int)d3d12_cl->GetType());
+            dm, comp, g_frame_id, (unsigned long long)section.out_va, current_index, current_frame, previous_index,
+            previous_frame, (unsigned long long)state.gfx_pso, (int)d3d12_cl->GetType());
     LogPtSkinReadback();
     PtSkinGpu::Outputs* outputs = OutputsOf(device.Get(), once_key, vertices);
     if (!outputs) return {};
     const uint64_t gen = g_command_lists.Gen(cmd_list);
-    Xit(d3d12_cl, gen, current_slot, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    if (has_previous) Xit(d3d12_cl, gen, previous_slot, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    if (current_slot) Xit(d3d12_cl, gen, *current_slot, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    if (has_previous) Xit(d3d12_cl, gen, *previous_slot, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
     ReadyModBufferForSkin(d3d12_cl, positions.res);
     ReadyModBufferForSkin(d3d12_cl, vectors.res);
@@ -1852,7 +1906,7 @@ VfRestore RtDrawPass::SkinDraw(reshade::api::command_list* cmd_list, ID3D12Graph
     d3d12_cl->SetComputeRootSignature(s_gpu.root_signature.Get());
     d3d12_cl->SetPipelineState(s_gpu.pso.Get());
     d3d12_cl->SetComputeRoot32BitConstants(0, 4, constants, 0);
-    d3d12_cl->SetComputeRootShaderResourceView(1, current_slot.va());
+    d3d12_cl->SetComputeRootShaderResourceView(1, bones_va);
     d3d12_cl->SetComputeRootShaderResourceView(2, positions.va);
     d3d12_cl->SetComputeRootShaderResourceView(3, vectors.va);
     d3d12_cl->SetComputeRootShaderResourceView(4, blend.va);
@@ -1865,14 +1919,14 @@ VfRestore RtDrawPass::SkinDraw(reshade::api::command_list* cmd_list, ID3D12Graph
         uint32_t previous_constants[4] = { vertices, previous_bone_count, 0, 0 };
         memcpy(&previous_constants[2], &section.scale, sizeof(float));
         d3d12_cl->SetComputeRoot32BitConstants(0, 4, previous_constants, 0);
-        d3d12_cl->SetComputeRootShaderResourceView(1, previous_slot.va());
+        d3d12_cl->SetComputeRootShaderResourceView(1, previous_slot->va());
         d3d12_cl->SetComputeRootUnorderedAccessView(6, outputs->previous_positions.va());
         d3d12_cl->Dispatch((vertices + 63) / 64, 1, 1);
     }
 
     Xit(d3d12_cl, gen, outputs->tangents, kDrawReadState);
     Xit(d3d12_cl, gen, outputs->colors, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
-    if (g_debug && comp == s_gpu.readback_done % 8 && s_gpu.readback_frame == 0 && s_gpu.readback_done < 16 &&
+    if (g_debug && comp == s_gpu.readback_done % 8 && s_gpu.readback_frame == 0 && s_gpu.readback_done < 480 &&
         g_frame_id >= s_gpu.readback_next_frame) {
         if (!s_gpu.readback) {
             s_gpu.readback = WwmiMakeBuffer(device.Get(), 512, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE,
@@ -1882,9 +1936,48 @@ VfRestore RtDrawPass::SkinDraw(reshade::api::command_list* cmd_list, ID3D12Graph
                 s_gpu.readback_data = static_cast<const uint8_t*>(mapped);
         }
         if (s_gpu.readback_data) {
-            Xit(d3d12_cl, gen, current_slot, D3D12_RESOURCE_STATE_COPY_SOURCE);
             Xit(d3d12_cl, gen, outputs->positions, D3D12_RESOURCE_STATE_COPY_SOURCE);
-            d3d12_cl->CopyBufferRegion(s_gpu.readback.Get(), 0, current_slot.res.Get(), 0, 96);
+            s_gpu.readback_first_bone = 0;
+            s_gpu.readback_palette_frame = 0;
+            if (current_slot) {
+                Xit(d3d12_cl, gen, *current_slot, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                d3d12_cl->CopyBufferRegion(s_gpu.readback.Get(), 0, current_slot->res.Get(), 0, 96);
+            } else if (skeleton.res) {
+                // The mod's merged skeleton: the first two bones this component owns in it (a remapped
+                // skeleton starts with them), and the game's palette for the section, to compare.
+                const uint32_t first_bone = wc->remap_id >= 0 ? 0 : wc->vg_offset;
+                const uint64_t offset = skeleton.va - skeleton.res->GetGPUVirtualAddress() +
+                                        (uint64_t)first_bone * kBoneBytes;
+                if (((uint64_t)first_bone + 2) * kBoneBytes <= skeleton.size) {
+                    const bool readable = (skeleton.state & D3D12_RESOURCE_STATE_COPY_SOURCE) != 0;
+                    D3D12_RESOURCE_BARRIER barrier{};
+                    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                    barrier.Transition.pResource = skeleton.res;
+                    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                    barrier.Transition.StateBefore = (D3D12_RESOURCE_STATES)skeleton.state;
+                    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                    if (!readable) d3d12_cl->ResourceBarrier(1, &barrier);
+                    d3d12_cl->CopyBufferRegion(s_gpu.readback.Get(), 0, skeleton.res, offset, 96);
+                    std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+                    if (!readable) d3d12_cl->ResourceBarrier(1, &barrier);
+                    s_gpu.readback_first_bone = first_bone;
+                }
+                const auto section_palette = s_gpu.palettes.find({ dm, PaletteKey(section) });
+                if (section_palette != s_gpu.palettes.end()) {
+                    PtSkinGpu::Palette& palette = section_palette->second;
+                    int newest = -1;
+                    for (int i = 0; i < PtSkinGpu::kSlots; ++i) {
+                        if (palette.bytes[i] == 0 || palette.frame[i] > g_frame_id) continue;
+                        if (newest < 0 || palette.frame[i] > palette.frame[newest]) newest = i;
+                    }
+                    if (newest >= 0) {
+                        Xit(d3d12_cl, gen, palette.slot[newest], D3D12_RESOURCE_STATE_COPY_SOURCE);
+                        d3d12_cl->CopyBufferRegion(s_gpu.readback.Get(), 288, palette.slot[newest].res.Get(), 0, 96);
+                        Xit(d3d12_cl, gen, palette.slot[newest], D3D12_RESOURCE_STATE_COMMON);
+                        s_gpu.readback_palette_frame = palette.frame[newest];
+                    }
+                }
+            }
             for (uint32_t i = 0; i < 16; ++i) { // vertex i * vertices / 16
                 const uint64_t vertex = (uint64_t)i * vertices / 16;
                 d3d12_cl->CopyBufferRegion(s_gpu.readback.Get(), 96 + i * 12, outputs->positions.res.Get(),
@@ -1893,13 +1986,13 @@ VfRestore RtDrawPass::SkinDraw(reshade::api::command_list* cmd_list, ID3D12Graph
             s_gpu.readback_vertices = vertices;
             s_gpu.readback_frame = g_frame_id;
             s_gpu.readback_key = once_key;
-            s_gpu.readback_slot_frame = palette.frame[current_index];
+            s_gpu.readback_slot_frame = current_frame;
         }
     }
     Xit(d3d12_cl, gen, outputs->positions, kDrawReadState);
     if (has_previous) Xit(d3d12_cl, gen, outputs->previous_positions, kDrawReadState);
-    Xit(d3d12_cl, gen, current_slot, D3D12_RESOURCE_STATE_COMMON);
-    if (has_previous) Xit(d3d12_cl, gen, previous_slot, D3D12_RESOURCE_STATE_COMMON);
+    if (current_slot) Xit(d3d12_cl, gen, *current_slot, D3D12_RESOURCE_STATE_COMMON);
+    if (has_previous) Xit(d3d12_cl, gen, *previous_slot, D3D12_RESOURCE_STATE_COMMON);
     if (const uint64_t game_pso = state.gfx_restore())
         d3d12_cl->SetPipelineState(reinterpret_cast<ID3D12PipelineState*>(game_pso));
     const bool compute_restored = RestoreGameComputeRoot(cmd_list, d3d12_cl);
@@ -2089,9 +2182,56 @@ VfRestore RtDrawPass::StampVertexFetch(reshade::api::command_list* cmd_list, ID3
     return restore;
 }
 
-RtPalResult RtDrawPass::PalPublish(uint64_t, int, const WwmiMod::Component*, uint64_t)
+/**
+ * Hands a merged-skeleton mod the bones of the game's section before the mod's component section runs. Without
+ * ray tracing such a mod reads the game's skeleton at vs-cb4 and copies it into its merged skeleton (WWMI's
+ * SkeletonMerger). On the ray-tracing draw path the game binds no skeleton there, so the palette copied at the
+ * game's skin dispatch is published as vs-cb4 instead: same layout, 3 float4 rows per bone.
+ *
+ * @param cmd_list      The command list the draw is recorded on.
+ * @param d3d12_cl      The same list.
+ * @param dm            The mod's id.
+ * @param wc            The component about to run.
+ * @param vertex_offset The game draw's base vertex.
+ * @return tried when the draw is a pass-through draw of a merged-skeleton mod (the caller then publishes no
+ *         other skeleton); published when the palette was handed over.
+ */
+RtPalResult RtDrawPass::PalPublish(reshade::api::command_list* cmd_list, ID3D12GraphicsCommandList* d3d12_cl, int dm,
+    const WwmiMod::Component* wc, int32_t vertex_offset)
 {
-    return {};
+    RtPalResult result;
+    if (!wc || !d3d12_cl || dm < 0 || wc->vg_count == 0) return result;
+    const CmdState& state = g_command_lists.Gfx(cmd_list);
+    if (!IsPassThroughPso(state.gfx_pso)) return result;
+    result.tried = true;
+    const int comp = wc->index;
+    const uint64_t window_va = state.vb[0].va + (int64_t)vertex_offset * kModPositionStride;
+    const uint64_t window_end = state.vb[0].va + state.vb[0].size;
+    SkinSection section;
+    size_t section_total = 0;
+    if (!state.vb[0].va || !SectionInWindow(dm, comp, window_va, window_end, &section, &section_total)) return result;
+
+    std::lock_guard lock(s_gpu.mutex);
+    const auto palette_found = s_gpu.palettes.find({ dm, PaletteKey(section) });
+    if (palette_found == s_gpu.palettes.end()) return result;
+    PtSkinGpu::Palette& palette = palette_found->second;
+    int current_index = -1; // this frame's copy, else the newest one
+    for (int i = 0; i < PtSkinGpu::kSlots; ++i) {
+        if (palette.bytes[i] == 0 || palette.frame[i] > g_frame_id) continue;
+        if (current_index < 0 || palette.frame[i] > palette.frame[current_index]) current_index = i;
+    }
+    if (current_index < 0) return result;
+    Owned& slot = palette.slot[current_index];
+    // A buffer left in the common state is readable as a constant buffer without a transition.
+    Xit(d3d12_cl, g_command_lists.Gen(cmd_list), slot, D3D12_RESOURCE_STATE_COMMON);
+    PortApi::PushGameConstantBuffer('v', 4, slot.res.Get(), slot.va(), kDx11SkeletonCbByteWidth);
+    result.published = true;
+    if (LogOnce(17, dm * 256 + (comp & 0xFF)))
+        logger::write("PTSKIN-MERGED mod=%d comp=%d: the section's palette (%u bones, copied in frame %u) is published "
+                      "as vs-cb4 for the mod's skeleton merge (vg_offset %u, vg_count %u)",
+            dm, comp, palette.bytes[current_index] / kBoneBytes, palette.frame[current_index], wc->vg_offset,
+            wc->vg_count);
+    return result;
 }
 
 // ---- RTCSDUMP: the game's skin-cache compute shaders, saved for offline study ----

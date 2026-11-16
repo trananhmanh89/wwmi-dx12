@@ -45,7 +45,8 @@ VfRestore RtDrawPass::SkinDraw(reshade::api::command_list*, ID3D12GraphicsComman
 {
     return {};
 }
-RtPalResult RtDrawPass::PalPublish(uint64_t, int, const WwmiMod::Component*, uint64_t)
+RtPalResult RtDrawPass::PalPublish(reshade::api::command_list*, ID3D12GraphicsCommandList*, int,
+    const WwmiMod::Component*, int32_t)
 {
     return {};
 }

@@ -283,7 +283,7 @@ static void PushGameBindings(ComponentRun& run)
         if (!g_pipelines.VsCbufferBytes(draw_pso, reg, decl)) return kDx11SkeletonCbByteWidth;
         return decl == kBoneCBBytes ? kDx11SkeletonCbByteWidth : decl;
     };
-    const RtPalResult pal = g_rt_draw.PalPublish(draw_pso, dm, wc, dc.b4_cb.va);
+    const RtPalResult pal = g_rt_draw.PalPublish(cmd_list, ctx.args.d3d12_cl, dm, wc, ctx.args.vertex_offset);
     if (pal.published) {
         t_b4_root = -1;
         run.rtpal_no_merge = pal.no_merge;

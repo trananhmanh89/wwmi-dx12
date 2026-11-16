@@ -11,8 +11,83 @@
 #include "../hooks/cmd_bind_hooks.h"
 #include "../migoto/frame_analysis_driver.h"
 #include "../mods/mod_set.h"
+#include "../mods/game_cb_reader.h"
+#include "../mods/layout_registry.h"
+#include <map>
+#include <string>
+#include <mutex>
+#include <set>
+#include <utility>
 
 DispatchToggles g_dispatch_toggles;
+
+/**
+ * Debug only: logs each compute shader the game dispatches, once per group count, to find the shaders a render
+ * path uses (the morph shaders with ray tracing on).
+ *
+ * @param cs_hash       The compute shader's hash.
+ * @param group_count_x The dispatch's group counts.
+ * @param group_count_y
+ * @param group_count_z
+ * @return Nothing.
+ */
+static void LogDispatchOnce(uint64_t cs_hash, uint32_t group_count_x, uint32_t group_count_y, uint32_t group_count_z)
+{
+    if (!g_debug) return;
+    static std::mutex s_mutex;
+    static std::set<std::pair<uint64_t, uint64_t>> s_seen;
+    std::lock_guard<std::mutex> lock(s_mutex);
+    if (s_seen.size() >= 600) return;
+    const uint64_t groups = ((uint64_t)group_count_x << 40) ^ ((uint64_t)group_count_y << 20) ^ group_count_z;
+    if (!s_seen.insert({ cs_hash, groups }).second) return;
+    logger::write("CSSEEN cs=%016llx groups=%u,%u,%u frame=%u", (unsigned long long)cs_hash, group_count_x,
+        group_count_y, group_count_z, g_frame_id);
+}
+
+/**
+ * Debug only: logs the shape key weights the game hands its morph shader (cb0: 128 list offsets, 128 weights,
+ * two rows of scales), once per mesh each time they change. Shows whether they are fixed for a character.
+ *
+ * @param cmd_list      The command list of the dispatch.
+ * @param group_count_y The dispatch's second group count (the mesh's shape key entries / 32).
+ * @return Nothing.
+ */
+static void LogMorphWeights(command_list* cmd_list, uint32_t group_count_y)
+{
+    if (!g_debug) return;
+    const uint64_t layout = g_command_lists.CmpLayout(cmd_list);
+    const int root = layout ? g_layouts.CsCb0Root(layout) : -1;
+    if (root < 0 || root >= 64) return;
+    const CmdState& state = g_command_lists.Gfx(cmd_list);
+    uint32_t cb0[66 * 4] = {};
+    const uint32_t got = g_game_cbs.Snapshot(state.root[root].res, state.root[root].va,
+        reinterpret_cast<uint8_t*>(cb0), sizeof(cb0), true);
+    if (got < sizeof(cb0)) return;
+    const uint32_t checksum = cb0[0] + cb0[1] + cb0[2] + cb0[3];
+    uint64_t weights_hash = 14695981039346656037ull;
+    std::string weights;
+    for (int i = 0; i < 128; ++i) {
+        const uint32_t bits = cb0[32 * 4 + i];
+        weights_hash = (weights_hash ^ bits) * 1099511628211ull;
+        if (!bits) continue;
+        float value = 0;
+        memcpy(&value, &bits, sizeof(value));
+        char part[40];
+        snprintf(part, sizeof(part), " %d=%.3f", i, value);
+        weights += part;
+    }
+    static std::mutex s_mutex;
+    static std::map<uint64_t, uint64_t> s_last; // (checksum, group count) -> the weights logged last
+    static int s_lines = 0;
+    std::lock_guard<std::mutex> lock(s_mutex);
+    const uint64_t key = ((uint64_t)checksum << 32) | group_count_y;
+    const auto found = s_last.find(key);
+    if (found != s_last.end() && found->second == weights_hash) return;
+    s_last[key] = weights_hash;
+    if (s_lines++ >= 300) return;
+    logger::write("MORPHWEIGHTS checksum=%u groups_y=%u frame=%u: non-zero weights:%s", checksum, group_count_y,
+        g_frame_id, weights.empty() ? " none" : weights.c_str());
+}
 
 bool on_dispatch(command_list* cmd_list, uint32_t group_count_x, uint32_t group_count_y, uint32_t group_count_z)
 {
@@ -30,10 +105,13 @@ bool on_dispatch(command_list* cmd_list, uint32_t group_count_x, uint32_t group_
     if (g_sk_toggles.publish_shader_state) PortApi::SetBoundShader('c', AliasShaderHash(cs_hash));
 
     DispatchDiagShapekey(da);
+    LogDispatchOnce(cs_hash, group_count_x, group_count_y, group_count_z);
 
     SkU0Ident ck;
     ck.shapekey = (g_dispatch_toggles.morph_cs_hash &&
         (cs_hash == g_dispatch_toggles.morph_cs_hash || cs_hash == 0xc1a7f1fec51b482fULL));
+
+    if (cs_hash == g_dispatch_toggles.morph_cs_hash) LogMorphWeights(cmd_list, group_count_y);
 
     {
         PROF(PROF_Disp_Resolve);

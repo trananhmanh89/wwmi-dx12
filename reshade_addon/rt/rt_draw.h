@@ -27,7 +27,9 @@ public:
     VfRestore SkinDraw(reshade::api::command_list* cmd_list, ID3D12GraphicsCommandList* d3d12_cl, int dm,
         const WwmiMod::Component* wc, uint32_t c, uint32_t s2, uint32_t first_index, uint32_t index_count,
         int32_t vertex_offset, uint64_t vs_hash, uint64_t b4_va, int b4_root, bool rtpal_no_merge);
-    RtPalResult PalPublish(uint64_t draw_pso, int dm, const WwmiMod::Component* wc, uint64_t b4_va);
+    // Before a component section runs: the game's bones for a merged-skeleton mod on a pass-through draw.
+    RtPalResult PalPublish(reshade::api::command_list* cmd_list, ID3D12GraphicsCommandList* d3d12_cl, int dm,
+        const WwmiMod::Component* wc, int32_t vertex_offset);
 
 private:
     VfRestore StampVertexFetch(reshade::api::command_list* cmd_list, ID3D12GraphicsCommandList* cl,
