@@ -8,7 +8,8 @@ struct AddonSettings {
     bool oil_off = false; // ini oil_off: the CustomOilFX hotkeys do nothing (the launcher's "Oil skin" box is off)
     bool tex_deferred = true; // mod textures load off the engine lock, vanilla until in (A12)
     // ini tex_hide_loading: with A12 on, a mod that comes on screen is not drawn (nor is the game's model it
-    // replaces) until its textures are loaded, instead of showing with the game's textures for a moment.
+    // replaces) until its textures are loaded, instead of showing with the game's textures for a moment. The
+    // game's draws of a mesh not yet known as a mod's are left out for its first frames as well.
     bool tex_hide_loading = true;
     bool texlod_resemblance = true; // A13 / ini lod_resemblance: look-alike LOD matches applied (always learned)
     bool texlod_cache =

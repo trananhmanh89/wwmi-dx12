@@ -31,6 +31,16 @@ public:
      * @return True when the draw must not be issued.
      */
     bool HidesDraw(int mod);
+
+    /**
+     * Tells whether the game's own draw that a mod's section ran for stays hidden: during the first frames of
+     * the mod's appearance (its section may not draw yet) and while HidesDraw hides the mod. Without it the
+     * game's model would flash before the mod shows. Call it once per section run, after the section.
+     *
+     * @param mod The mod's registry id.
+     * @return True when the game's draw must not be issued.
+     */
+    bool HidesGameDraw(int mod);
     void Stop();
     ~TexDefer()
     {
@@ -75,6 +85,9 @@ private:
         std::atomic<bool> shown{ false }; // the mod has been drawn: it is not hidden again
     };
     static constexpr int kAppearances = 1024; // mods with a higher id are never hidden
+    static constexpr uint32_t kGoneFrames = 30; // not drawn for this long: the next draw starts a new appearance
+    static constexpr uint32_t kSettleFrames = 3; // loads of one appearance may start a few frames apart
+    Appearance* TouchAppearance(int mod);
     std::array<Appearance, kAppearances> appearances_;
     std::mutex mtx_;
     std::condition_variable cv_;

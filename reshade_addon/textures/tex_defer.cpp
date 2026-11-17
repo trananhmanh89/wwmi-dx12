@@ -160,13 +160,16 @@ void TexDefer::Run()
     }
 }
 
-bool TexDefer::HidesDraw(int mod)
+/**
+ * Notes that a mod is being drawn this frame and starts a new appearance when it had left the screen.
+ *
+ * @param mod The mod's registry id.
+ * @return The mod's appearance, or null when hiding is off or the mod has none.
+ */
+TexDefer::Appearance* TexDefer::TouchAppearance(int mod)
 {
-    constexpr uint32_t kGoneFrames = 30; // not drawn for this long: the next draw starts a new appearance
-    constexpr uint32_t kSettleFrames = 3; // loads of one appearance may start a few frames apart
-
-    if (!g_settings.tex_deferred || !g_settings.tex_hide_loading) return false;
-    if (mod < 0 || mod >= kAppearances) return false;
+    if (!g_settings.tex_deferred || !g_settings.tex_hide_loading) return nullptr;
+    if (mod < 0 || mod >= kAppearances) return nullptr;
     Appearance& appearance = appearances_[mod];
     const uint32_t now = g_frame_id;
     const uint32_t last_draw = appearance.last_draw.exchange(now, std::memory_order_acq_rel);
@@ -176,6 +179,26 @@ bool TexDefer::HidesDraw(int mod)
         appearance.hidden_since.store(0, std::memory_order_release);
         appearance.shown.store(false, std::memory_order_release);
     }
+    return &appearance;
+}
+
+bool TexDefer::HidesGameDraw(int mod)
+{
+    Appearance* const found = TouchAppearance(mod);
+    if (!found || found->shown.load(std::memory_order_acquire)) return false;
+    const uint32_t now = g_frame_id;
+    if (now - found->first_draw.load(std::memory_order_acquire) < kSettleFrames) return true;
+    if (Pending(mod)) found->last_pending.store(now, std::memory_order_release);
+    const uint32_t last_pending = found->last_pending.load(std::memory_order_acquire);
+    return last_pending != 0 && now - last_pending <= kSettleFrames;
+}
+
+bool TexDefer::HidesDraw(int mod)
+{
+    Appearance* const found = TouchAppearance(mod);
+    if (!found) return false;
+    Appearance& appearance = *found;
+    const uint32_t now = g_frame_id;
     if (appearance.shown.load(std::memory_order_acquire)) return false;
 
     if (Pending(mod)) appearance.last_pending.store(now, std::memory_order_release);

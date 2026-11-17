@@ -684,5 +684,7 @@ bool DrawComponent(DrawContext& ctx, int dm, const WwmiMod::Component* wc)
     }
     for (unsigned r = 0; r < kSectionTexRegs; ++r)
         if (sect_tex & (1u << r)) PortApi::UnpushGameTexture('p', r);
-    return FinishSection(run, ran, skip_orig, sk_inst);
+    // The mod has just come on screen: until it shows, the game's model it stands for stays hidden too.
+    const bool hide_game_draw = ran && !skip_orig && g_tex_defer.HidesGameDraw(dm);
+    return FinishSection(run, ran, skip_orig || hide_game_draw, sk_inst);
 }
