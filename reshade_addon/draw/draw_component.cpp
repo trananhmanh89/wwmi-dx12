@@ -283,11 +283,17 @@ static void PushGameBindings(ComponentRun& run)
         if (!g_pipelines.VsCbufferBytes(draw_pso, reg, decl)) return kDx11SkeletonCbByteWidth;
         return decl == kBoneCBBytes ? kDx11SkeletonCbByteWidth : decl;
     };
+    // On a ray-tracing pass-through draw the game's vs-b4 and vs-b3 are not skeletons (vs-b4 holds the material
+    // constants), so nothing published as vs-cb4 / vs-cb3 may reach the game's root slots: not the palette that
+    // PalPublish hands to the mod, and not the mod's merged skeleton.
+    const int claimed_b4_root = t_b4_root;
+    t_b4_root = -1;
     const RtPalResult pal = g_rt_draw.PalPublish(cmd_list, ctx.args.d3d12_cl, dm, wc, ctx.args.vertex_offset);
-    if (pal.published) {
-        t_b4_root = -1;
-        run.rtpal_no_merge = pal.no_merge;
-    }
+    if (pal.tried)
+        t_b3_root = -1;
+    else
+        t_b4_root = claimed_b4_root;
+    if (pal.published) run.rtpal_no_merge = pal.no_merge;
     constexpr unsigned kNotSkeletonWidth = 256;
     if (!pal.published)
         PortApi::PushGameConstantBuffer('v', 4, dc.b4_cb.res, dc.b4_cb.va, pal.tried ? kNotSkeletonWidth : cb_width(4));

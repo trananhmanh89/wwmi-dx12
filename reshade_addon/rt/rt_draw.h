@@ -30,6 +30,8 @@ public:
     // Before a component section runs: the game's bones for a merged-skeleton mod on a pass-through draw.
     RtPalResult PalPublish(reshade::api::command_list* cmd_list, ID3D12GraphicsCommandList* d3d12_cl, int dm,
         const WwmiMod::Component* wc, int32_t vertex_offset);
+    // The device is being destroyed: everything created on it is released.
+    void OnDestroyDevice();
 
 private:
     VfRestore StampVertexFetch(reshade::api::command_list* cmd_list, ID3D12GraphicsCommandList* cl,

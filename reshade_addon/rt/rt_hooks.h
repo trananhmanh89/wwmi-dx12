@@ -27,6 +27,9 @@ struct RtDrawnRange {
 void RtNoteComponentDraw(int mod, ID3D12Resource* game_ib, uint64_t game_ib_va, uint32_t game_ib_bytes,
     uint32_t game_first_index, uint32_t game_index_count, bool skip_original, const RtDrawnRange* drawn,
     uint32_t drawn_count);
+// The device is being destroyed: the module releases everything it created on it and forgets what it learned
+// about the device's buffers and pipelines; the stub ignores it.
+void RtOnDestroyDevice();
 // The game dispatches rays; debug: logs the hit-group records of a mod character's instance.
 void RtNoteDispatchRays(ID3D12Resource* hit_groups, uint64_t offset, uint64_t size, uint64_t stride, uint32_t width,
     uint32_t height);

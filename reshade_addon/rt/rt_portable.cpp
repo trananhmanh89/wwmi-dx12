@@ -107,6 +107,28 @@ void RtSkinRings::Note(uint64_t va, uint64_t bytes, int mod)
 {
     if (!va || !bytes) return;
     std::lock_guard lock(mutex_);
+    if (mod >= 0) {
+        // The game hands a character's old output memory to the next character it shows. A ring another mod
+        // owned in this range is no longer that mod's: left in place, it would keep claiming the skin dispatches
+        // into it, and this mod would find only some of its sections (drawn in one frame, missing in the next).
+        const uint64_t end = va + bytes;
+        const uint64_t owner = NsHash(mod);
+        std::vector<Ring> kept;
+        kept.reserve(rings_.size());
+        for (const Ring& ring : rings_) {
+            const bool overlaps = va < ring.va + ring.bytes && ring.va < end;
+            const bool other_mods = ring.ns_hash != 0 && ring.ns_hash != owner;
+            if (!(overlaps && other_mods)) kept.push_back(ring);
+        }
+        if (kept.size() != rings_.size()) {
+            static std::atomic<int> s_taken_logs{ 0 };
+            if (g_debug && s_taken_logs.fetch_add(1) < 24)
+                logger::write("RTRINGS mod=%d frame=%u: %zu ring(s) of another mod in %llx..%llx forgotten, the range "
+                              "is this mod's now",
+                    mod, g_frame_id, rings_.size() - kept.size(), (unsigned long long)va, (unsigned long long)end);
+            rings_.swap(kept);
+        }
+    }
     for (Ring& ring : rings_) {
         if (ring.va == va && ring.bytes == bytes) {
             if (mod >= 0) ring.ns_hash = NsHash(mod);
@@ -350,6 +372,9 @@ std::map<uint64_t, GameIndexBuffer> s_game_index_buffers; // by the address the 
 std::unordered_map<uint64_t, CutBlas> s_cut_blas; // by the BLAS's address
 std::vector<std::pair<Microsoft::WRL::ComPtr<ID3D12Resource>, uint32_t>> s_cut_retired;
 std::atomic<int> s_cut_logs{ 0 };
+uint32_t s_cut_purge_frame = 0; // the frame PurgeCutBuffers last ran in
+
+void PurgeCutBuffers();
 
 /**
  * Mixes a value into a signature.
@@ -383,6 +408,7 @@ void RtNoteComponentDraw(int mod, ID3D12Resource* game_ib, uint64_t game_ib_va, 
     if (!cut) signature = 1;
 
     std::lock_guard lock(s_cut_mutex);
+    PurgeCutBuffers();
     if (game_ib && game_ib_va) s_game_index_buffers[game_ib_va] = GameIndexBuffer{ game_ib, game_ib_bytes };
     ComponentCut& entry = s_cuts[{ mod, game_first_index }];
     if (entry.signature == signature) return;
@@ -399,10 +425,12 @@ void RtNoteComponentDraw(int mod, ID3D12Resource* game_ib, uint64_t game_ib_va, 
 }
 
 /**
- * Releases what RTHIDE no longer needs. Call with s_cut_mutex held.
+ * Releases what RTHIDE no longer needs, at most once per frame. Call with s_cut_mutex held.
  */
 void PurgeCutBuffers()
 {
+    if (s_cut_purge_frame == g_frame_id) return;
+    s_cut_purge_frame = g_frame_id;
     for (size_t i = 0; i < s_cut_retired.size();) {
         if (g_frame_id > s_cut_retired[i].second + kCutRetireFrames) {
             s_cut_retired[i] = std::move(s_cut_retired.back());
@@ -493,6 +521,7 @@ bool BuildCutBlas(reshade::api::command_list* cmd_list, int mod, reshade::api::a
         if (inputs[i].type != reshade::api::acceleration_structure_build_input_type::triangles) return false;
 
     std::lock_guard lock(s_cut_mutex);
+    PurgeCutBuffers();
     const ComponentCut* cuts[kCutMaxInputs] = {};
     bool any_cut = false;
     for (uint32_t i = 0; i < input_count; ++i) {
@@ -523,7 +552,6 @@ bool BuildCutBlas(reshade::api::command_list* cmd_list, int mod, reshade::api::a
     if (!cl || FAILED(cl->QueryInterface(IID_PPV_ARGS(&cl4))) || FAILED(cl->GetDevice(IID_PPV_ARGS(&device)))) return false;
 
     if (blas_found == s_cut_blas.end()) {
-        PurgeCutBuffers();
         blas_found = s_cut_blas.emplace(dest.handle, CutBlas{}).first;
         if (g_debug)
             logger::write("RTHIDE: the BLAS at %llx of mod %d (%u inputs) is built by the add-on from now on (frame %u)",
@@ -960,6 +988,7 @@ struct SkinSection {
     uint64_t bones_bytes = 0; // the palette's size
     ID3D12Resource* bones_res = nullptr; // the buffer the palette lives in
     float scale = 1.0f;
+    uint32_t frame = 0;       // the frame the game skinned it in
 };
 
 /** The sections of one mod character: the frame being recorded, and the last complete one. */
@@ -1219,6 +1248,58 @@ bool SectionBefore(const SkinSection& a, const SkinSection& b)
  */
 void CopySectionPalette(reshade::api::command_list* cmd_list, const CmdState& state, int mod,
     const SkinSection& section);
+uint64_t PaletteKey(const SkinSection& section);
+
+// A character that comes back on screen is skinned into a buffer the module has not seen yet, and only the mod's
+// draw, later in the frame, tells whose buffer it is. So that such a frame is drawn too, the module remembers
+// which mods drew a section of a given size (s_section_mods), and keeps the sections of that size that no mod
+// owns yet (s_unowned) for the draw to find by its vb0 window. Both are guarded by s_sections_mutex.
+constexpr size_t kSectionModsCap = 4096;
+constexpr size_t kUnownedCap = 512;
+constexpr uint32_t kBorrowedSectionFrames = 2; // a section not recorded for the drawing mod is used this long
+std::unordered_map<uint64_t, std::vector<int>> s_section_mods; // PaletteKey -> the mods that drew such a section
+std::vector<SkinSection> s_unowned;
+
+/**
+ * Remembers that a mod has a section of this size. Call with s_sections_mutex held.
+ *
+ * @param key The section's PaletteKey.
+ * @param mod The mod.
+ */
+void LearnSectionMod(uint64_t key, int mod)
+{
+    const auto found = s_section_mods.find(key);
+    if (found == s_section_mods.end()) {
+        if (s_section_mods.size() < kSectionModsCap) s_section_mods[key].push_back(mod);
+        return;
+    }
+    for (int known : found->second) {
+        if (known == mod) return;
+    }
+    found->second.push_back(mod);
+}
+
+/**
+ * Keeps a section that no mod owns yet, for the draws of this frame and the next ones. Call with s_sections_mutex
+ * held.
+ *
+ * @param section The section.
+ */
+void NoteUnownedSection(const SkinSection& section)
+{
+    size_t kept = 0;
+    for (size_t i = 0; i < s_unowned.size(); ++i) {
+        const bool recent = s_unowned[i].frame + kBorrowedSectionFrames >= g_frame_id;
+        if (recent && s_unowned[i].out_va != section.out_va) s_unowned[kept++] = s_unowned[i];
+    }
+    s_unowned.resize(kept);
+    if (s_unowned.size() < kUnownedCap) s_unowned.push_back(section);
+    static std::atomic<int> s_unowned_logs{ 0 };
+    if (g_debug && s_unowned_logs.fetch_add(1) < 24)
+        logger::write("PTSKIN-EARLY frame=%u: a section of a known size (%u vertices) into %llx, a buffer no mod owns "
+                      "yet -- kept for the draw",
+            g_frame_id, section.count, (unsigned long long)section.out_va);
+}
 
 void RecordSkinSection(reshade::api::command_list* cmd_list, const CmdState& state, uint64_t cs_hash)
 {
@@ -1272,6 +1353,7 @@ void RecordSkinSection(reshade::api::command_list* cmd_list, const CmdState& sta
     section.bones_va = bones_range.va;
     section.bones_bytes = bones_range.bytes;
     section.bones_res = bones_range.res;
+    section.frame = g_frame_id;
     if (section.count == 0) return;
     int overlap = -1;
     const int exact = g_rt_rings.ModOf(section.out_va, (uint64_t)section.count * kModPositionStride, &overlap);
@@ -1292,10 +1374,23 @@ void RecordSkinSection(reshade::api::command_list* cmd_list, const CmdState& sta
             }
         }
     }
-    if (mod < 0) return;
-    CopySectionPalette(cmd_list, state, mod, section);
+    // Every mod that has a section of this size gets a copy of the palette, also when the output buffer is not
+    // known as that mod's yet (or is still taken for another mod's): its draw may be the one that reads it.
+    std::vector<int> palette_mods;
+    {
+        std::lock_guard lock(s_sections_mutex);
+        if (mod >= 0) LearnSectionMod(PaletteKey(section), mod);
+        const auto known = s_section_mods.find(PaletteKey(section));
+        if (known != s_section_mods.end()) palette_mods = known->second;
+    }
+    if (palette_mods.empty()) return;
+    for (int palette_mod : palette_mods) CopySectionPalette(cmd_list, state, palette_mod, section);
 
     std::lock_guard lock(s_sections_mutex);
+    if (mod < 0) {
+        NoteUnownedSection(section);
+        return;
+    }
     ModSections& sections = s_sections[mod];
     if (sections.frame != g_frame_id) {
         if (!sections.collecting.empty()) {
@@ -1340,6 +1435,29 @@ void RecordSkinSection(reshade::api::command_list* cmd_list, const CmdState& sta
 }
 
 /**
+ * Adds a section to the ones found in a draw's vb0 window; of two at the same address the newer one stays.
+ *
+ * @param inside     The sections found so far.
+ * @param section    The section to add.
+ * @param any_age    true for the drawing mod's own sections; others count only while they are fresh.
+ * @param window_va  The start of the window.
+ * @param window_end Its end.
+ */
+void KeepNewestInWindow(std::vector<SkinSection>* inside, const SkinSection& section, bool any_age, uint64_t window_va,
+    uint64_t window_end)
+{
+    if (section.out_va < window_va || section.out_va >= window_end) return;
+    if (!any_age && section.frame + kBorrowedSectionFrames < g_frame_id) return;
+    for (SkinSection& other : *inside) {
+        if (other.out_va == section.out_va) {
+            if (section.frame > other.frame) other = section;
+            return;
+        }
+    }
+    inside->push_back(section);
+}
+
+/**
  * Finds a component's section among those the game skinned into the window its own draw binds at vb0. That window
  * is this mesh's output for this frame, so other meshes' sections and the other of the game's two rings fall
  * outside it. A mesh's sections follow one another without a gap, so the comp-th is found by walking from the
@@ -1359,20 +1477,21 @@ bool SectionInWindow(int mod, int comp, uint64_t window_va, uint64_t window_end,
 {
     std::lock_guard lock(s_sections_mutex);
     *total = 0;
-    const auto found = s_sections.find(mod);
-    if (found == s_sections.end()) return false;
-    const ModSections& sections = found->second;
+    // The window tells whose the sections are, so those recorded for no mod or for another one count as well
+    // while they are fresh: right after a character switch the buffer is not known as this mod's yet.
     std::vector<SkinSection> inside;
-    const std::vector<SkinSection>* lists[3] = { &sections.collecting, &sections.last, &sections.older };
-    for (const std::vector<SkinSection>* list : lists) {
-        for (const SkinSection& section : *list) {
-            if (section.out_va < window_va || section.out_va >= window_end) continue;
-            bool known = false;
-            for (const SkinSection& other : inside) {
-                if (other.out_va == section.out_va) known = true;
+    for (const auto& entry : s_sections) {
+        const bool own = entry.first == mod;
+        const ModSections& sections = entry.second;
+        const std::vector<SkinSection>* lists[3] = { &sections.collecting, &sections.last, &sections.older };
+        for (const std::vector<SkinSection>* list : lists) {
+            for (const SkinSection& section : *list) {
+                KeepNewestInWindow(&inside, section, own, window_va, window_end);
             }
-            if (!known) inside.push_back(section); // the newest list comes first, so it wins
         }
+    }
+    for (const SkinSection& section : s_unowned) {
+        KeepNewestInWindow(&inside, section, false, window_va, window_end);
     }
     *total = inside.size();
     if (comp < 0) return false;
@@ -1386,6 +1505,7 @@ bool SectionInWindow(int mod, int comp, uint64_t window_va, uint64_t window_end,
         if (index == comp) *out = *next;
         cursor += (uint64_t)next->count * kModPositionStride;
     }
+    LearnSectionMod(PaletteKey(*out), mod);
     return true;
 }
 
@@ -1424,6 +1544,7 @@ struct PtSkinGpu {
         Owned previous_positions; // skinned with the previous frame's palette: the draw's slot 4
         Owned colors;             // the mod's colors with red and blue swapped: the game reads B8G8R8A8
         uint32_t vertices = 0;
+        uint32_t last_frame = 0;  // the last frame a draw asked for them
     };
     // A section's bone palette, copied at the game's skin dispatch (RtPalCopy.cso). The game reuses its own
     // palette memory after the frame, so the mod is skinned from these.
@@ -1455,7 +1576,9 @@ struct PtSkinGpu {
     uint32_t readback_first_bone = 0;    // the first of the two bones read from the skeleton skinned with
     uint32_t readback_palette_frame = 0; // the frame of the section palette read with it; 0 = none
     uint32_t readback_vertices = 0;
-    std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> retired; // outgrown buffers a list in flight may still read
+    // Outgrown buffers a list in flight may still read, with the frame they were replaced in.
+    std::vector<std::pair<Microsoft::WRL::ComPtr<ID3D12Resource>, uint32_t>> retired;
+    uint32_t purge_frame = 0; // the frame PurgePtSkinBuffers last ran in
 };
 PtSkinGpu s_gpu;
 
@@ -1525,6 +1648,46 @@ bool EnsurePtSkinPipeline(ID3D12Device* device)
     return true;
 }
 
+constexpr uint32_t kPtSkinRetireFrames = 32; // a replaced buffer is kept this long: lists in flight may still read it
+constexpr uint32_t kPtSkinIdleFrames = 600;  // buffers of a component not drawn for this long are released
+
+/**
+ * Releases the PTSKIN buffers that are no longer used, at most once per frame: replaced output buffers, and the
+ * output buffers and palette copies of components that have not been drawn for a while (the character left,
+ * or its level of detail changed). Call with s_gpu.mutex held, before taking any of them for a draw.
+ */
+void PurgePtSkinBuffers()
+{
+    if (s_gpu.purge_frame == g_frame_id) return;
+    s_gpu.purge_frame = g_frame_id;
+    for (size_t i = 0; i < s_gpu.retired.size();) {
+        if (g_frame_id > s_gpu.retired[i].second + kPtSkinRetireFrames) {
+            s_gpu.retired[i] = std::move(s_gpu.retired.back());
+            s_gpu.retired.pop_back();
+        } else {
+            ++i;
+        }
+    }
+    for (auto it = s_gpu.by_component.begin(); it != s_gpu.by_component.end();) {
+        if (g_frame_id > it->second.last_frame + kPtSkinIdleFrames) {
+            it = s_gpu.by_component.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    for (auto it = s_gpu.palettes.begin(); it != s_gpu.palettes.end();) {
+        uint32_t newest_frame = 0;
+        for (int i = 0; i < PtSkinGpu::kSlots; ++i) {
+            if (it->second.frame[i] > newest_frame) newest_frame = it->second.frame[i];
+        }
+        if (g_frame_id > newest_frame + kPtSkinIdleFrames) {
+            it = s_gpu.palettes.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
 /**
  * Gives a mod component's output buffers, large enough for the mod's vertices. Call with s_gpu.mutex held.
  *
@@ -1537,13 +1700,16 @@ PtSkinGpu::Outputs* OutputsOf(ID3D12Device* device, int key, uint32_t vertices)
 {
     PtSkinGpu::Outputs& outputs = s_gpu.by_component[key];
     if (outputs.vertices >= vertices && outputs.positions.res && outputs.tangents.res &&
-        outputs.previous_positions.res && outputs.colors.res)
+        outputs.previous_positions.res && outputs.colors.res) {
+        outputs.last_frame = g_frame_id;
         return &outputs;
-    if (outputs.positions.res) s_gpu.retired.push_back(outputs.positions.res);
-    if (outputs.tangents.res) s_gpu.retired.push_back(outputs.tangents.res);
-    if (outputs.previous_positions.res) s_gpu.retired.push_back(outputs.previous_positions.res);
-    if (outputs.colors.res) s_gpu.retired.push_back(outputs.colors.res);
+    }
+    if (outputs.positions.res) s_gpu.retired.push_back({ outputs.positions.res, g_frame_id });
+    if (outputs.tangents.res) s_gpu.retired.push_back({ outputs.tangents.res, g_frame_id });
+    if (outputs.previous_positions.res) s_gpu.retired.push_back({ outputs.previous_positions.res, g_frame_id });
+    if (outputs.colors.res) s_gpu.retired.push_back({ outputs.colors.res, g_frame_id });
     outputs = PtSkinGpu::Outputs{};
+    outputs.last_frame = g_frame_id;
     outputs.positions.res = WwmiMakeBuffer(device, (UINT64)vertices * kModPositionStride, D3D12_HEAP_TYPE_DEFAULT,
         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
     outputs.tangents.res = WwmiMakeBuffer(device, (UINT64)vertices * kOutTangentStride, D3D12_HEAP_TYPE_DEFAULT,
@@ -1835,8 +2001,6 @@ VfRestore RtDrawPass::SkinDraw(reshade::api::command_list* cmd_list, ID3D12Graph
                 comp, (unsigned long long)vs_hash, (unsigned long long)state.gfx_pso, first_index, index_count,
                 g_frame_id);
     }
-    // Debug (ptskin_test = 5): component 3 is not drawn, to see what is left without it.
-    if (g_settings.ptskin_test == 5 && comp == 3) return CannotSkin();
 
     const MigotoPort::PipeState& port = MigotoPort::State();
     const MigotoPort::ShimVbRecord& positions = port.shim_vb[0];
@@ -1897,6 +2061,7 @@ VfRestore RtDrawPass::SkinDraw(reshade::api::command_list* cmd_list, ID3D12Graph
     if (FAILED(d3d12_cl->GetDevice(IID_PPV_ARGS(&device)))) return {};
     std::lock_guard lock(s_gpu.mutex);
     if (!EnsurePtSkinPipeline(device.Get())) return {};
+    PurgePtSkinBuffers();
     // The bones to skin with. A mod that keeps the game's skeletons apart uses its section's palette, as copied
     // at the game's skin dispatch. A mod that merges them numbers its bones over the merged skeleton, which its
     // own commands build (from the palettes PalPublish hands them) and bind at vs-cb4.
@@ -2145,11 +2310,28 @@ struct CopyVsRegMap {
     }
 };
 
+/**
+ * Tells whether 24 bytes read from a vertex-stage constant buffer are the game's LocalVF constants and not
+ * another buffer bound at the same register (the shadow passes keep their pass buffer at vs-b2).
+ *
+ * @param values The first six 32-bit values of the buffer.
+ * @return true when they read as { color index mask, UV set count, light map UV index, first vertex, ... }.
+ */
+bool LooksLikeLocalVf(const int32_t* values)
+{
+    const bool color_mask_fits = values[0] >= -1 && values[0] <= 255;
+    const bool uv_set_count_fits = values[1] >= 1 && values[1] <= 8;
+    const bool light_map_index_fits = values[2] >= -1 && values[2] <= 8;
+    const bool first_vertex_fits = values[3] >= 0 && values[3] < 0x1000000;
+    return color_mask_fits && uv_set_count_fits && light_map_index_fits && first_vertex_fits;
+}
+
 } // namespace
 
 /**
  * Points the buffer SRVs the pass-through vertex shader loads by vertex id at the mod's buffers, and gives the draw
- * a copy of the game's LocalVF constants (vs-b2) that indexes them from vertex 0 with four UV sets. Which register
+ * a copy of the game's LocalVF constants (vs-b2, vs-b3 in the shadow passes) that indexes them from vertex 0 with
+ * four UV sets. Which register
  * holds what differs per shader, so each is told by the format of the view the game has bound there.
  *
  * @param cmd_list The game's command list (ReShade's).
@@ -2249,11 +2431,25 @@ VfRestore RtDrawPass::StampVertexFetch(reshade::api::command_list* cmd_list, ID3
         restore.fetch = true;
     }
 
-    // LocalVF (vs-b2): int4 { color index mask, UV set count, light map UV index, first vertex }.
+    // LocalVF: int4 { color index mask, UV set count, light map UV index, first vertex }. It is vs-b2 in the
+    // color passes and vs-b3 in the shadow passes, where vs-b2 is the pass's own buffer and must stay.
     int32_t local_vf[8] = {};
-    const RegBind& cb = cbs[2];
+    unsigned local_vf_register = 0;
+    bool local_vf_found = false;
+    for (unsigned candidate_register = 2; candidate_register <= 3 && !local_vf_found; ++candidate_register) {
+        const RegBind& candidate = cbs[candidate_register];
+        int32_t values[8] = {};
+        if (candidate.param >= 64 || candidate.is_table) continue;
+        if (!g_game_cbs.ReadRootCbv(cmd_list, candidate.param, values, 24)) continue;
+        if (candidate_register == 2) memcpy(local_vf, values, sizeof(local_vf)); // logged when neither fits
+        if (!LooksLikeLocalVf(values)) continue;
+        memcpy(local_vf, values, sizeof(local_vf));
+        local_vf_register = candidate_register;
+        local_vf_found = true;
+    }
+    const RegBind& cb = cbs[local_vf_found ? local_vf_register : 2];
     bool cb_copied = false;
-    if (!slots.empty() && cb.param < 64 && !cb.is_table && g_game_cbs.ReadRootCbv(cmd_list, cb.param, local_vf, 24)) {
+    if (!slots.empty() && local_vf_found) {
         int32_t ours[8];
         memcpy(ours, local_vf, sizeof(ours));
         ours[1] = 4; // the mod's vb2 holds four UV sets per vertex
@@ -2301,10 +2497,12 @@ VfRestore RtDrawPass::StampVertexFetch(reshade::api::command_list* cmd_list, ID3
             readable ? "read and saved" : "not readable", non_zero);
     }
     if (log)
-        logger::write("PTSKIN-FETCH mod=%d comp=%d pso=%llx:%s | LocalVF (root %u%s) = %d %d %d %d %d %d -> %s", dm, comp,
-            (unsigned long long)state.gfx_pso, report.empty() ? " no buffer SRV in the vertex stage" : report.c_str(),
-            (unsigned)cb.param, cb.is_table ? ", in a table" : "", local_vf[0], local_vf[1], local_vf[2], local_vf[3],
-            local_vf[4], local_vf[5], cb_copied ? "replaced with UV sets 4, first vertex 0" : "left as it is");
+        logger::write("PTSKIN-FETCH mod=%d comp=%d pso=%llx:%s | LocalVF (%s, root %u%s) = %d %d %d %d %d %d -> %s", dm,
+            comp, (unsigned long long)state.gfx_pso,
+            report.empty() ? " no buffer SRV in the vertex stage" : report.c_str(),
+            !local_vf_found ? "not found, vs-b2 shown" : local_vf_register == 2 ? "vs-b2" : "vs-b3", (unsigned)cb.param,
+            cb.is_table ? ", in a table" : "", local_vf[0], local_vf[1], local_vf[2], local_vf[3], local_vf[4],
+            local_vf[5], cb_copied ? "replaced with UV sets 4, first vertex 0" : "left as it is");
     return restore;
 }
 
@@ -2358,6 +2556,58 @@ RtPalResult RtDrawPass::PalPublish(reshade::api::command_list* cmd_list, ID3D12G
             dm, comp, palette.bytes[current_index] / kBoneBytes, palette.frame[current_index], wc->vg_offset,
             wc->vg_count);
     return result;
+}
+
+void RtDrawPass::OnDestroyDevice()
+{
+    std::lock_guard lock(fetch_mutex_);
+    fetch_heap_.Reset();
+    fetch_next_ = 0;
+    lvf_ring_.Reset();
+}
+
+void RtOnDestroyDevice()
+{
+    {
+        std::lock_guard lock(s_gpu.mutex);
+        s_gpu.root_signature.Reset();
+        s_gpu.pso.Reset();
+        s_gpu.copy_pso.Reset();
+        s_gpu.tried = false;
+        s_gpu.by_component.clear();
+        s_gpu.palettes.clear();
+        s_gpu.retired.clear();
+        s_gpu.readback.Reset();
+        s_gpu.readback_data = nullptr;
+        s_gpu.readback_frame = 0;
+        s_skin_dumps.clear();
+        s_skin_dump_frame.clear();
+    }
+    {
+        std::lock_guard lock(s_cut_mutex);
+        s_cut_blas.clear();
+        s_cut_retired.clear();
+        s_game_index_buffers.clear();
+    }
+    {
+        std::lock_guard lock(s_sections_mutex);
+        s_sections.clear();
+        s_unowned.clear();
+        s_section_mods.clear();
+    }
+    {
+        std::lock_guard lock(s_mesh_mutex);
+        s_mesh_mod.clear();
+    }
+    {
+        std::lock_guard lock(s_pso_mutex);
+        s_pass_through.clear();
+    }
+    {
+        std::lock_guard lock(s_scene_mutex);
+        s_mod_blas.clear();
+    }
+    g_rt_draw.OnDestroyDevice();
 }
 
 // ---- RTCSDUMP: the game's skin-cache compute shaders, saved for offline study ----

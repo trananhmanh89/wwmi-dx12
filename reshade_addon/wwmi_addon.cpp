@@ -32,6 +32,7 @@
 #include "instrumentation/hot_path.h"
 #include "instrumentation/game_draw_record.h"
 #include "draw/draw_hook.h"
+#include "rt/rt_hooks.h" // RtOnDestroyDevice
 #include "draw/draw_sectex.h"
 #include "present/present_log.h"
 #include "addon/addon.h"
@@ -71,6 +72,7 @@ static void on_destroy_swapchain(swapchain*, bool resize)
 static void on_destroy_device(device*)
 {
     g_watchdogs.Stop();
+    RtOnDestroyDevice(); // the RT module's pipelines and buffers live on this device
     g_rfx_patch.Stop(); // it creates PSOs on this device
     g_matcap.Stop(); // so does this one
     g_descriptors.UnwatchAll();
@@ -375,12 +377,13 @@ static void SetupDirectories()
     }
     g_addon.wwmi_dir = wwmi_dir_buf;
     {
-        // DX12's own mods folder: mods_folder in wwmi_dx12.ini (default Mods_dx12), used when it exists under the
-        // WWMI folder; otherwise the Mods folder d3dx.ini names, which DX11 uses too.
+        // DX12's own mods folder: mods_folder in wwmi_dx12.ini (default Mods_dx12), used when use_mods_folder = 1
+        // and it exists under the WWMI folder; otherwise the Mods folder d3dx.ini names, which DX11 uses too.
         std::wstring mods_folder = g_settings.String(L"mods_folder");
         if (mods_folder.empty()) mods_folder = L"Mods_dx12";
+        const bool wanted = g_settings.String(L"use_mods_folder") == L"1";
         const DWORD attributes = GetFileAttributesW((g_addon.wwmi_dir + L"\\" + mods_folder).c_str());
-        const bool usable = _wcsicmp(mods_folder.c_str(), L"Mods") != 0 && attributes != INVALID_FILE_ATTRIBUTES &&
+        const bool usable = wanted && _wcsicmp(mods_folder.c_str(), L"Mods") != 0 && attributes != INVALID_FILE_ATTRIBUTES &&
             (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
         PortApi::SetModsFolder(usable ? mods_folder.c_str() : L"");
         if (usable) CopyDx11Toggles(g_addon.wwmi_dir, mods_folder);
