@@ -142,7 +142,7 @@ struct CmdBlock {
     uint64_t gfx_layout = 0; // active graphics root signature for this list
     uint64_t cmp_layout = 0; // ... and the compute one
     CmdGfxRoot gfx_root;
-    CmdGfxRoot cmp_root; // the same for the compute root signature (rt_portable.cpp puts it back after PTSKIN)
+    CmdGfxRoot cmp_root; // the same for the compute root signature (rt_skin_gpu.cpp puts it back after PTSKIN)
     uint64_t gen = 1;
     uint64_t drew_gen = 0; // the recording (gen) a game draw was recorded in
     uint64_t frame_end_gen = 0; // the recording a back-buffer-sized texture went to COMMON in: the game's frame end
