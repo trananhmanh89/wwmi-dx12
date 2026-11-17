@@ -2071,7 +2071,8 @@ VfRestore RtDrawPass::SkinDraw(reshade::api::command_list* cmd_list, ID3D12Graph
     uint64_t bones_va = 0;
     uint32_t bone_count = 0;
     Owned* current_slot = nullptr; // the palette copy the bones are in; none for a merged skeleton
-    Owned* previous_slot = nullptr;
+    Owned* previous_slot = nullptr; // the palette copy the previous frame's bones are in; none for a merged skeleton
+    uint64_t previous_bones_va = 0; // the previous frame's bones; 0 = not known, no motion
     uint32_t previous_bone_count = 0;
     int current_index = -1;
     int previous_index = -1;
@@ -2095,6 +2096,25 @@ VfRestore RtDrawPass::SkinDraw(reshade::api::command_list* cmd_list, ID3D12Graph
         }
         bones_va = skeleton.va;
         bone_count = skeleton.size / kBoneBytes;
+        // The mod's second merged skeleton, bound at vs-cb3, holds the previous frame's bones.
+        void* previous_bound = MigotoPort::AcquireShimVsCb(3);
+        const bool previous_is_the_mods = previous_bound && !MigotoPort::ShimObjectForeign(previous_bound);
+        MigotoPort::ReleaseShimObject(previous_bound);
+        MigotoPort::ShimBufView previous_skeleton;
+        const char* previous_why = nullptr;
+        if (previous_is_the_mods && g_settings.ptskin_test != 1 &&
+            MigotoPort::ShimBufferForCompute(d3d12_cl, 'c', 3, &previous_skeleton, &previous_why) &&
+            previous_skeleton.va && previous_skeleton.va != skeleton.va) {
+            previous_bones_va = previous_skeleton.va;
+            previous_bone_count = previous_skeleton.size / kBoneBytes;
+        }
+        if (LogOnce(18, once_key))
+            logger::write("PTSKIN-MERGED mod=%d comp=%d: previous frame's skeleton at vs-cb3: %s", dm, comp,
+                previous_bones_va           ? "the mod's, previous positions are skinned with it"
+                    : !previous_bound       ? "nothing bound -- no motion vectors"
+                    : !previous_is_the_mods ? "the game's buffer, the mod merged none -- no motion vectors"
+                    : previous_why          ? previous_why
+                                            : "not usable -- no motion vectors");
         if (LogOnce(16, once_key))
             logger::write("PTSKIN-MERGED mod=%d comp=%d: skinned with the skeleton the mod binds at vs-cb4 (%llx, %u "
                           "bytes, %u bones; vg_offset %u, vg_count %u, remap %d)",
@@ -2131,11 +2151,12 @@ VfRestore RtDrawPass::SkinDraw(reshade::api::command_list* cmd_list, ID3D12Graph
         // The previous palette gives the positions motion vectors are made from; without it, no motion.
         if (previous_index >= 0 && g_settings.ptskin_test != 1) {
             previous_slot = &palette.slot[previous_index];
+            previous_bones_va = previous_slot->va();
             previous_bone_count = palette.bytes[previous_index] / kBoneBytes;
             previous_frame = palette.frame[previous_index];
         }
     }
-    const bool has_previous = previous_slot != nullptr;
+    const bool has_previous = previous_bones_va != 0;
     static std::atomic<int> s_trace_draws{ 0 };
     if (g_debug && comp == 0 && s_trace_draws.fetch_add(1) < 64)
         logger::write("PTSKIN-TRACE draw mod=%d comp=%d frame=%u out=%llx slot=%d (frame %u) previous=%d (frame %u) "
@@ -2147,7 +2168,7 @@ VfRestore RtDrawPass::SkinDraw(reshade::api::command_list* cmd_list, ID3D12Graph
     if (!outputs) return {};
     const uint64_t gen = g_command_lists.Gen(cmd_list);
     if (current_slot) Xit(d3d12_cl, gen, *current_slot, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    if (has_previous) Xit(d3d12_cl, gen, *previous_slot, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    if (previous_slot) Xit(d3d12_cl, gen, *previous_slot, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
     ReadyModBufferForSkin(d3d12_cl, positions.res);
     ReadyModBufferForSkin(d3d12_cl, vectors.res);
@@ -2177,7 +2198,7 @@ VfRestore RtDrawPass::SkinDraw(reshade::api::command_list* cmd_list, ID3D12Graph
         uint32_t previous_constants[5] = { vertices, previous_bone_count, 0, 0, weights_per_vertex };
         memcpy(&previous_constants[2], &section.scale, sizeof(float));
         d3d12_cl->SetComputeRoot32BitConstants(0, 5, previous_constants, 0);
-        d3d12_cl->SetComputeRootShaderResourceView(1, previous_slot->va());
+        d3d12_cl->SetComputeRootShaderResourceView(1, previous_bones_va);
         d3d12_cl->SetComputeRootUnorderedAccessView(6, outputs->previous_positions.va());
         d3d12_cl->Dispatch((vertices + 63) / 64, 1, 1);
     }
@@ -2258,7 +2279,7 @@ VfRestore RtDrawPass::SkinDraw(reshade::api::command_list* cmd_list, ID3D12Graph
     Xit(d3d12_cl, gen, outputs->positions, kDrawReadState);
     if (has_previous) Xit(d3d12_cl, gen, outputs->previous_positions, kDrawReadState);
     if (current_slot) Xit(d3d12_cl, gen, *current_slot, D3D12_RESOURCE_STATE_COMMON);
-    if (has_previous) Xit(d3d12_cl, gen, *previous_slot, D3D12_RESOURCE_STATE_COMMON);
+    if (previous_slot) Xit(d3d12_cl, gen, *previous_slot, D3D12_RESOURCE_STATE_COMMON);
     if (const uint64_t game_pso = state.gfx_restore())
         d3d12_cl->SetPipelineState(reinterpret_cast<ID3D12PipelineState*>(game_pso));
     const bool compute_restored = RestoreGameComputeRoot(cmd_list, d3d12_cl);
@@ -2553,6 +2574,20 @@ RtPalResult RtDrawPass::PalPublish(reshade::api::command_list* cmd_list, ID3D12G
     Xit(d3d12_cl, g_command_lists.Gen(cmd_list), slot, D3D12_RESOURCE_STATE_COMMON);
     PortApi::PushGameConstantBuffer('v', 4, slot.res.Get(), slot.va(), kDx11SkeletonCbByteWidth);
     result.published = true;
+    // The newest copy older than that one is the previous frame's palette. The mod merges it into its second
+    // skeleton (vs-cb3), which SkinDraw skins the previous positions with: without them the game sees no motion
+    // of the character and its anti-aliasing breaks up while the character moves.
+    int previous_index = -1;
+    for (int i = 0; i < PtSkinGpu::kSlots; ++i) {
+        if (palette.bytes[i] == 0 || palette.frame[i] >= palette.frame[current_index]) continue;
+        if (previous_index < 0 || palette.frame[i] > palette.frame[previous_index]) previous_index = i;
+    }
+    if (previous_index >= 0 && g_settings.ptskin_test != 1) {
+        Owned& previous = palette.slot[previous_index];
+        Xit(d3d12_cl, g_command_lists.Gen(cmd_list), previous, D3D12_RESOURCE_STATE_COMMON);
+        PortApi::PushGameConstantBuffer('v', 3, previous.res.Get(), previous.va(), kDx11SkeletonCbByteWidth);
+        result.previous_published = true;
+    }
     if (LogOnce(17, dm * 256 + (comp & 0xFF)))
         logger::write("PTSKIN-MERGED mod=%d comp=%d: the section's palette (%u bones, copied in frame %u) is published "
                       "as vs-cb4 for the mod's skeleton merge (vg_offset %u, vg_count %u)",

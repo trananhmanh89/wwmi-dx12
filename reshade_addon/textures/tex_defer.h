@@ -11,8 +11,8 @@
 #include <unordered_map>
 #include <vector>
 
-// A mod texture loaded on a worker, off the engine lock, the first time a draw asks for it; the draw keeps the game's
-// texture until it is in. With A12 off none is taken: each loads where it is first asked for, as on DX11.
+// A mod texture loaded on one of a few workers, off the engine lock, the first time a draw asks for it; the draw
+// keeps the game's texture until it is in. With A12 off none is taken: each loads where it is first asked for, as on DX11.
 class TexDefer {
 public:
     void Start(); // hands the port its sink
@@ -44,7 +44,8 @@ public:
     void Stop();
     ~TexDefer()
     {
-        if (thread_.joinable()) thread_.detach();
+        for (std::thread& worker : workers_)
+            if (worker.joinable()) worker.detach();
     }
 
 private:
@@ -92,7 +93,25 @@ private:
     std::mutex mtx_;
     std::condition_variable cv_;
     bool stop_ = false; // under mtx_
-    std::thread thread_; // started under mtx_
+    // Textures loaded at the same time. 4 made a burst about 2.8 times shorter than one worker, but each load
+    // slower and one frame-rate drop while switching teams quickly; 2 is the user's choice (2026-11-17).
+    static constexpr unsigned kWorkers = 2;
+    std::vector<std::thread> workers_; // started under mtx_
+    /** What the workers loaded since the queue was last empty, for one log line. Under mtx_. */
+    struct Burst {
+        unsigned working = 0; // jobs being loaded right now
+        unsigned jobs = 0; // jobs finished
+        unsigned made = 0;
+        unsigned stale = 0;
+        unsigned smaller = 0;
+        long long start = 0; // performance counter when the first job was taken
+        long long locked = 0; // counter ticks spent publishing, under the engine lock
+        long long longest = 0; // counter ticks of the slowest load
+        long long load_sum = 0; // counter ticks of all loads added up
+        std::wstring first_namespace;
+        bool several_namespaces = false;
+    };
+    Burst burst_;
 };
 extern TexDefer g_tex_defer;
 

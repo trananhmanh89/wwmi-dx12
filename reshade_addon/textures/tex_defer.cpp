@@ -85,7 +85,8 @@ bool TexDefer::Offer(const PortApi::DeferredTexture& t, void* user)
             self->returns_.erase(back);
         }
         self->queue_.push_back(std::move(job));
-        if (!self->thread_.joinable()) self->thread_ = std::thread(&TexDefer::Run, self);
+        if (self->workers_.empty())
+            for (unsigned i = 0; i < kWorkers; ++i) self->workers_.emplace_back(&TexDefer::Run, self);
     }
     self->cv_.notify_one();
     return true;
@@ -93,70 +94,82 @@ bool TexDefer::Offer(const PortApi::DeferredTexture& t, void* user)
 
 void TexDefer::Run()
 {
+    LARGE_INTEGER frequency;
+    QueryPerformanceFrequency(&frequency);
     for (;;) {
-        std::deque<Job> batch;
+        Job job;
         {
             std::unique_lock l(mtx_);
             cv_.wait(l, [this] { return stop_ || !queue_.empty(); });
             if (stop_) return;
-            batch.swap(queue_);
+            job = std::move(queue_.front());
+            queue_.pop_front();
+            if (!burst_.working && !burst_.jobs) {
+                LARGE_INTEGER now;
+                QueryPerformanceCounter(&now);
+                burst_.start = now.QuadPart;
+            }
+            ++burst_.working;
         }
-        LARGE_INTEGER f;
-        LARGE_INTEGER t0;
-        LARGE_INTEGER t1;
-        QueryPerformanceFrequency(&f);
-        QueryPerformanceCounter(&t0);
-        unsigned made = 0;
-        unsigned stale = 0;
-        unsigned smaller = 0;
-        LONGLONG locked = 0;
-        LONGLONG longest = 0;
-        for (const Job& job : batch) {
-            {
-                std::lock_guard l(mtx_);
-                if (stop_) return;
+        bool made = false;
+        bool stale = false;
+        LARGE_INTEGER a{};
+        LARGE_INTEGER b{};
+        LARGE_INTEGER c{};
+        if (PortApi::LoadGeneration() != job.gen) {
+            stale = true;
+        } else {
+            QueryPerformanceCounter(&a);
+            ID3D11Resource* res = PortApi::LoadDeferredTexture(job.tex);
+            QueryPerformanceCounter(&b);
+            if (res) {
+                if (PortApi::PublishDeferredTexture(job.tex.fq_name.c_str(), res))
+                    made = true;
+                else
+                    res->Release();
             }
-            if (PortApi::LoadGeneration() != job.gen) {
-                ++stale;
-            } else {
-                LARGE_INTEGER a;
-                LARGE_INTEGER b;
-                LARGE_INTEGER c;
-                QueryPerformanceCounter(&a);
-                ID3D11Resource* res = PortApi::LoadDeferredTexture(job.tex);
-                QueryPerformanceCounter(&b);
-                if (res) {
-                    if (PortApi::PublishDeferredTexture(job.tex.fq_name.c_str(), res)) {
-                        ++made;
-                        if (job.tex.maxsize) ++smaller;
-                    } else {
-                        res->Release();
-                    }
-                }
-                QueryPerformanceCounter(&c);
-                locked += c.QuadPart - b.QuadPart;
-                if (b.QuadPart - a.QuadPart > longest) longest = b.QuadPart - a.QuadPart;
-            }
+            QueryPerformanceCounter(&c);
+        }
+        if (made) loaded_.fetch_add(1, std::memory_order_acq_rel);
+
+        Burst done;
+        bool burst_over = false;
+        {
             std::lock_guard l(mtx_);
             if (job.mod >= 0 && job.gen == gen_.load(std::memory_order_relaxed))
                 Slot(job.mod).fetch_sub(1, std::memory_order_acq_rel);
             in_flight_.fetch_sub(1, std::memory_order_acq_rel);
-        }
-        loaded_.fetch_add(made, std::memory_order_acq_rel);
-        QueryPerformanceCounter(&t1);
-        std::vector<std::wstring> namespaces;
-        for (const Job& job : batch) {
+            ++burst_.jobs;
+            if (made) ++burst_.made;
+            if (made && job.tex.maxsize) ++burst_.smaller;
+            if (stale) ++burst_.stale;
+            burst_.locked += c.QuadPart - b.QuadPart;
+            burst_.load_sum += b.QuadPart - a.QuadPart;
+            if (b.QuadPart - a.QuadPart > burst_.longest) burst_.longest = b.QuadPart - a.QuadPart;
             std::wstring ns = PortApi::NamespaceOfResource(job.tex.fq_name);
-            if (std::find(namespaces.begin(), namespaces.end(), ns) == namespaces.end())
-                namespaces.push_back(std::move(ns));
+            if (burst_.first_namespace.empty())
+                burst_.first_namespace = std::move(ns);
+            else if (ns != burst_.first_namespace)
+                burst_.several_namespaces = true;
+            --burst_.working;
+            if (queue_.empty() && !burst_.working) {
+                done = std::move(burst_);
+                burst_ = Burst{};
+                burst_over = true;
+            }
         }
-        const double ms = 1000.0 / (double)f.QuadPart;
+        if (!burst_over) continue;
+        LARGE_INTEGER end;
+        QueryPerformanceCounter(&end);
+        const double ms = 1000.0 / (double)frequency.QuadPart;
         logger::write(
-            "TEXDEFER '%ls'%s: loaded %u of %zu texture(s), %u of them asked for at the size they were let go at, "
-            "in %.0f ms, %.0f ms of it under the engine lock (longest texture %.0f ms)%s",
-            namespaces.front().c_str(), namespaces.size() > 1 ? " and others" : "", made, batch.size(), smaller,
-            (double)(t1.QuadPart - t0.QuadPart) * ms, (double)locked * ms, (double)longest * ms,
-            stale ? " -- some were asked for before the inis were reloaded, not loaded" : "");
+            "TEXDEFER '%ls'%s: loaded %u of %u texture(s) on %u threads, %u of them asked for at the size they were "
+            "let go at, in %.0f ms (loads added up %.0f ms), %.0f ms of it under the engine lock (longest texture "
+            "%.0f ms)%s",
+            done.first_namespace.c_str(), done.several_namespaces ? " and others" : "", done.made, done.jobs, kWorkers,
+            done.smaller, (double)(end.QuadPart - done.start) * ms, (double)done.load_sum * ms,
+            (double)done.locked * ms, (double)done.longest * ms,
+            done.stale ? " -- some were asked for before the inis were reloaded, not loaded" : "");
     }
 }
 
@@ -235,5 +248,6 @@ void TexDefer::Stop()
         queue_.clear();
     }
     cv_.notify_all();
-    if (thread_.joinable()) thread_.join();
+    for (std::thread& worker : workers_)
+        if (worker.joinable()) worker.join();
 }

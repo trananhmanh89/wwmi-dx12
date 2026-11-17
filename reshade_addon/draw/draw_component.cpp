@@ -309,7 +309,7 @@ static void PushGameBindings(ComponentRun& run)
                 kNotSkeletonWidth);
         w3 = kNotSkeletonWidth;
     }
-    PortApi::PushGameConstantBuffer('v', 3, dc.b3_cb.res, dc.b3_cb.va, w3);
+    if (!pal.previous_published) PortApi::PushGameConstantBuffer('v', 3, dc.b3_cb.res, dc.b3_cb.va, w3);
     {
         const RootCbvBind obj = ObjectCbOf(cmd_list);
         if (obj.res && obj.va) PortApi::PushGameConstantBuffer('v', 2, obj.res, obj.va, kDx11ObjectCbByteWidth);

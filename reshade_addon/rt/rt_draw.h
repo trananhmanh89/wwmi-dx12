@@ -17,6 +17,7 @@ struct VfRestore {
 struct RtPalResult {
     bool tried = false;
     bool published = false;
+    bool previous_published = false; // the previous frame's palette was published as vs-cb3 too
     bool no_merge = false;
 };
 
