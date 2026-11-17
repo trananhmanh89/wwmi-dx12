@@ -80,6 +80,7 @@ struct Site {
 };
 std::unordered_map<const char*, Site> g_sites; // by format string; under g_log_cs
 std::atomic<bool> g_unlimited{ false };
+std::vector<std::string> g_focus_tags; // "mod=N" and "mod N" of the mods set_focus_mods named; under g_log_cs
 constexpr double kBurst = 100.0;
 constexpr double kRefillMs = 10000.0;
 }
@@ -97,10 +98,50 @@ bool unlimited()
     return g_unlimited.load(std::memory_order_relaxed);
 }
 
+void set_focus_mods(const std::vector<int>& mod_ids)
+{
+    if (!g_log_inited) return;
+    EnterCriticalSection(&g_log_cs);
+    g_focus_tags.clear();
+    for (const int mod_id : mod_ids) {
+        g_focus_tags.push_back("mod=" + std::to_string(mod_id));
+        g_focus_tags.push_back("mod " + std::to_string(mod_id));
+    }
+    LeaveCriticalSection(&g_log_cs);
+}
+
+/**
+ * Tells whether a formatted line mentions one of the mods set_focus_mods named.
+ *
+ * @param line The formatted log line.
+ * @return True when it does.
+ */
+static bool MentionsFocusMod(const char* line)
+{
+    for (const std::string& tag : g_focus_tags) {
+        const char* found = strstr(line, tag.c_str());
+        while (found) {
+            const char after = found[tag.size()];
+            if (after < '0' || after > '9') return true; // "mod=3" must not match "mod=34"
+            found = strstr(found + 1, tag.c_str());
+        }
+    }
+    return false;
+}
+
 static void vwrite(const char* fmt, va_list args, bool limited = true)
 {
     if (!g_log_file) return;
     EnterCriticalSection(&g_log_cs);
+
+    char buf[4096];
+    bool formatted = false;
+    int n = 0;
+    if (limited && !g_focus_tags.empty()) {
+        n = _vsnprintf_s_l(buf, sizeof(buf), _TRUNCATE, fmt, utf8_locale(), args);
+        formatted = true;
+        if (MentionsFocusMod(buf)) limited = false;
+    }
 
     unsigned dropped = 0;
     bool notice = false;
@@ -127,8 +168,7 @@ static void vwrite(const char* fmt, va_list args, bool limited = true)
     SYSTEMTIME t;
     GetLocalTime(&t);
     fprintf(g_log_file, "[%02d:%02d:%02d.%03d] ", t.wHour, t.wMinute, t.wSecond, t.wMilliseconds);
-    char buf[4096];
-    int n = _vsnprintf_s_l(buf, sizeof(buf), _TRUNCATE, fmt, utf8_locale(), args);
+    if (!formatted) n = _vsnprintf_s_l(buf, sizeof(buf), _TRUNCATE, fmt, utf8_locale(), args);
     if (n < 0) n = (int)strnlen(buf, sizeof(buf) - 1); // truncated: emit what fitted
     fwrite(buf, 1, (size_t)n, g_log_file);
     if (dropped) fprintf(g_log_file, " [+%u not shown]", dropped);

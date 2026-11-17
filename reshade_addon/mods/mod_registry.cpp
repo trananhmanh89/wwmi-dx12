@@ -4,6 +4,7 @@
 #include "component_table.h"
 #include "port_section.h"
 #include "../addon/addon.h"
+#include "../addon/settings.h"
 #include "../core/log.h"
 #include "../textures/mod_texture_store.h"
 #include "../draw/draw_toggles.h"
@@ -166,6 +167,32 @@ void ModRegistry::Build()
             end = (std::max)(end, mc.first_index + mc.match_count);
         }
     }
+    // Mods that declare the same mesh hash must hash the same extent of it, or only one of them can match. The
+    // hash is taken over the vertices the indices reach, so indices declared past the mesh's real end (a component
+    // the game's mesh does not have) spoil it; the shortest declared extent is used for all of them.
+    std::unordered_map<uint32_t, uint32_t> shortest_end;
+    for (const auto& per_mod : index_end_) {
+        for (const auto& entry : per_mod) {
+            const auto found = shortest_end.find(entry.first);
+            if (found == shortest_end.end()) {
+                shortest_end[entry.first] = entry.second;
+            } else if (entry.second < found->second) {
+                found->second = entry.second;
+            }
+        }
+    }
+    for (size_t mod_id = 0; mod_id < index_end_.size(); ++mod_id) {
+        for (auto& entry : index_end_[mod_id]) {
+            if (entry.first == 0u) continue; // no hash= in the ini: nothing shared
+            const uint32_t shortest = shortest_end[entry.first];
+            if (shortest != entry.second) {
+                logger::write("WwmiGeom: hash=%08x: mod %zu declares indices up to %u, another mod only up to %u -- "
+                              "the mesh is hashed up to %u for both",
+                    entry.first, mod_id, entry.second, shortest, shortest);
+                entry.second = shortest;
+            }
+        }
+    }
     for (MergedComp& mc : Comps().All()) mc.with.clear();
     for (size_t a = 0; a < Comps().Count(); ++a) {
         const MergedComp& ma = Comps().At(a);
@@ -216,6 +243,39 @@ void ModRegistry::Build()
         }
     }
     if (!units_.empty()) Comps().Finalize();
+    FocusLogOnMods(g_settings.log_focus);
+}
+
+void ModRegistry::FocusLogOnMods(const std::wstring& name_parts) const
+{
+    // The comma-separated texts, in lower case and without the spaces around them.
+    std::vector<std::wstring> wanted;
+    size_t start = 0;
+    while (start <= name_parts.size()) {
+        size_t end = name_parts.find(L',', start);
+        if (end == std::wstring::npos) end = name_parts.size();
+        std::wstring part = name_parts.substr(start, end - start);
+        while (!part.empty() && part.front() == L' ') part.erase(part.begin());
+        while (!part.empty() && part.back() == L' ') part.pop_back();
+        std::transform(part.begin(), part.end(), part.begin(), towlower);
+        if (!part.empty()) wanted.push_back(part);
+        start = end + 1;
+    }
+
+    std::vector<int> mod_ids;
+    for (size_t mod_id = 0; mod_id < units_.size(); ++mod_id) {
+        std::wstring ns = units_[mod_id].wcl_ns;
+        std::transform(ns.begin(), ns.end(), ns.begin(), towlower);
+        bool matches = false;
+        for (const std::wstring& part : wanted) {
+            if (ns.find(part) != std::wstring::npos) matches = true;
+        }
+        if (!matches) continue;
+        mod_ids.push_back((int)mod_id);
+        logger::write("LOG-FOCUS: every line of mod %zu ('%ls') is written (ini log_focus = %ls)", mod_id,
+            units_[mod_id].wcl_ns.c_str(), name_parts.c_str());
+    }
+    logger::set_focus_mods(mod_ids);
 }
 
 std::vector<DiscoveredMod> ModRegistry::Discover()

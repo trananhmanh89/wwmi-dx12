@@ -10,7 +10,8 @@
 //   t0  the game's bone palette for the section: 3 float4 rows per bone (a 3x4 matrix)
 //   t1  the mod's positions (vb0): float3 per vertex
 //   t2  the mod's tangent frame (vb1): TangentX then TangentZ, each R8G8B8A8_SNORM
-//   t3  the mod's skin weights (vb4): 8 bone indices (uint8), then 8 weights (unorm8)
+//   t3  the mod's skin weights (vb4): g_weightsPerVertex bone indices (uint8), then as many weights (unorm8);
+//       8 of each, or 4 in mods made with 4 weights per vertex
 //   t4  the mod's vertex colors (vb3): R8G8B8A8_UNORM
 // Outputs, in the layout the game's pass-through vertex shader reads:
 //   u0  skinned positions: float3 per vertex
@@ -32,6 +33,7 @@ cbuffer Params : register(b0)
     uint  g_boneCount;   // bones the palette holds; an index past it is ignored
     float g_scale;       // the game's own position scale for the section (1 almost always)
     uint  g_writeTangents; // 0: positions only (the previous-frame pass); u1 and u2 are not written
+    uint  g_weightsPerVertex; // 8, or 4: bone indices and weights each vertex has in t3
 };
 
 /**
@@ -81,10 +83,19 @@ void main(uint3 thread_id : SV_DispatchThreadID)
     }
 
     // The blended bone matrix, row by row, as the game's skin shader builds it.
-    uint indices_low = Weights.Load(vertex * 16 + 0);
-    uint indices_high = Weights.Load(vertex * 16 + 4);
-    uint weights_low = Weights.Load(vertex * 16 + 8);
-    uint weights_high = Weights.Load(vertex * 16 + 12);
+    uint indices_low = 0;
+    uint indices_high = 0;
+    uint weights_low = 0;
+    uint weights_high = 0;
+    if (g_weightsPerVertex == 4) {
+        indices_low = Weights.Load(vertex * 8 + 0);
+        weights_low = Weights.Load(vertex * 8 + 4);
+    } else {
+        indices_low = Weights.Load(vertex * 16 + 0);
+        indices_high = Weights.Load(vertex * 16 + 4);
+        weights_low = Weights.Load(vertex * 16 + 8);
+        weights_high = Weights.Load(vertex * 16 + 12);
+    }
     float4 row0 = 0;
     float4 row1 = 0;
     float4 row2 = 0;

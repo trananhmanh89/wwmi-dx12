@@ -21,6 +21,7 @@
 #include "../migoto/frame_analysis_driver.h" // FrameAnalysisArm -- Numpad 2
 #include "../core/fnv.h" // Fnv1a32 -- KEYGATE logs each namespace once
 #include "../addon/addon.h"
+#include "../addon/settings.h" // g_settings.oil_off -- the key gate
 #include "../draw/draw_toggles.h"
 #include "../instrumentation/diag_arms.h"
 #include "frame_sync.h"
@@ -250,6 +251,8 @@ void EngineFrame::InstallKeyGate()
         if (!ns || !*ns) return true;
         if (section && _wcsicmp(section, L"Key\\WWMIv1\\HideNotification") == 0) return true;
         if (_wcsicmp(ns, L"WWMIv1") == 0 || _wcsicmp(ns, L"Debugger") == 0) return false;
+        // The launcher's "Oil skin" box is off: the CustomOilFX library's hotkeys must not bring the oil back.
+        if (g_settings.oil_off && _wcsicmp(ns, L"KatFXMatcap") == 0) return false;
         const int md = Mods().IdOfNs(ns);
         if (md < 0) return true; // unknown ns: fire, never swallow silently
         return Mods().OnScreen(md);

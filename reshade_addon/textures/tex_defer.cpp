@@ -3,6 +3,7 @@
 #include "../addon/settings.h"
 #include "../mods/character_recognition.h"
 #include "../core/log.h"
+#include "../core/frame_clock.h"
 #include <windows.h>
 #include <d3d11.h>
 #include <algorithm>
@@ -157,6 +158,43 @@ void TexDefer::Run()
             (double)(t1.QuadPart - t0.QuadPart) * ms, (double)locked * ms, (double)longest * ms,
             stale ? " -- some were asked for before the inis were reloaded, not loaded" : "");
     }
+}
+
+bool TexDefer::HidesDraw(int mod)
+{
+    constexpr uint32_t kGoneFrames = 30; // not drawn for this long: the next draw starts a new appearance
+    constexpr uint32_t kSettleFrames = 3; // loads of one appearance may start a few frames apart
+
+    if (!g_settings.tex_deferred || !g_settings.tex_hide_loading) return false;
+    if (mod < 0 || mod >= kAppearances) return false;
+    Appearance& appearance = appearances_[mod];
+    const uint32_t now = g_frame_id;
+    const uint32_t last_draw = appearance.last_draw.exchange(now, std::memory_order_acq_rel);
+    if (now - last_draw > kGoneFrames) {
+        appearance.first_draw.store(now, std::memory_order_release);
+        appearance.last_pending.store(0, std::memory_order_release);
+        appearance.hidden_since.store(0, std::memory_order_release);
+        appearance.shown.store(false, std::memory_order_release);
+    }
+    if (appearance.shown.load(std::memory_order_acquire)) return false;
+
+    if (Pending(mod)) appearance.last_pending.store(now, std::memory_order_release);
+    const uint32_t last_pending = appearance.last_pending.load(std::memory_order_acquire);
+    const bool loading = last_pending != 0 && now - last_pending <= kSettleFrames;
+    if (loading) {
+        uint32_t not_hidden = 0;
+        if (appearance.hidden_since.compare_exchange_strong(not_hidden, now) && g_debug)
+            logger::write("TEXHIDE mod=%d: not drawn while its textures load (frame %u)", mod, now);
+        return true;
+    }
+    if (now - appearance.first_draw.load(std::memory_order_acquire) < kSettleFrames) return false;
+    if (!appearance.shown.exchange(true, std::memory_order_acq_rel)) {
+        const uint32_t hidden_since = appearance.hidden_since.load(std::memory_order_acquire);
+        if (hidden_since && g_debug)
+            logger::write("TEXHIDE mod=%d: its textures are loaded, drawn again after %u frame(s) (frame %u)", mod,
+                now - hidden_since, now);
+    }
+    return false;
 }
 
 void TexDefer::ReturnAt(const std::wstring& fq_name, unsigned maxsize)

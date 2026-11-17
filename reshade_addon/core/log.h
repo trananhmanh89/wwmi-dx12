@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <ctime>
 #include <locale.h>
+#include <vector>
 
 namespace logger {
 
@@ -33,6 +34,14 @@ void report(_Printf_format_string_ const char* fmt,
     ...); // level 1, never rate-limited: a removal / stall / crash report, a line that paces itself
 
 void set_unlimited(bool on);
+
+/**
+ * Names the mods under investigation: a line that mentions one of them ("mod=N" or "mod N") is always written,
+ * however often it repeats. Every other line stays rate-limited.
+ *
+ * @param mod_ids The mods' registry ids; an empty list switches this off.
+ */
+void set_focus_mods(const std::vector<int>& mod_ids);
 bool unlimited();
 
 inline double ms_since(std::chrono::steady_clock::time_point t0) // for a line that says how long something took

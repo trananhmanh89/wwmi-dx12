@@ -40,6 +40,13 @@ struct DiscoveredMod {
 class ModRegistry {
 public:
     size_t Count() const { return units_.size(); }
+
+    /**
+     * Lifts the log's rate limit for the mods whose namespace (folder and ini path) contains one of the texts.
+     *
+     * @param name_parts The texts to look for, separated by commas, in any letter case; empty lifts it for no mod.
+     */
+    void FocusLogOnMods(const std::wstring& name_parts) const;
     GeoMod& At(size_t mod_id) { return units_[mod_id]; }
     const GeoMod& At(size_t mod_id) const { return units_[mod_id]; }
     std::deque<GeoMod>& Units() { return units_; }

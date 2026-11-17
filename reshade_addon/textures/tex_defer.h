@@ -1,5 +1,6 @@
 #pragma once
 #include "../migoto/port_api.h" // DeferredTexture
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -19,6 +20,17 @@ public:
     bool Loading() const { return in_flight_.load(std::memory_order_acquire) != 0; } // ... of any
     unsigned Loaded() const { return loaded_.load(std::memory_order_acquire); } // textures it made, ever
     void ReturnAt(const std::wstring& fq_name, unsigned maxsize); // let go of: its next load skips mips over this side
+
+    /**
+     * Tells whether a draw of a mod stays hidden because the mod has just come on screen and its textures are
+     * still loading (ini tex_hide_loading). Call it for every draw a mod's section issues, after the section's
+     * texture binds. Once the mod has been shown, later loads (an outfit toggle, a texture coming back at
+     * another size) never hide it again until it has left the screen.
+     *
+     * @param mod The mod's registry id.
+     * @return True when the draw must not be issued.
+     */
+    bool HidesDraw(int mod);
     void Stop();
     ~TexDefer()
     {
@@ -54,6 +66,16 @@ private:
         unsigned gen;
     };
     std::unordered_map<std::wstring, Return> returns_; // under mtx_
+    /** One mod's time on screen, for HidesDraw. Frames are g_frame_id values. */
+    struct Appearance {
+        std::atomic<uint32_t> last_draw{ 0 }; // the last frame a draw of the mod was asked about
+        std::atomic<uint32_t> first_draw{ 0 }; // the frame this appearance began in
+        std::atomic<uint32_t> last_pending{ 0 }; // the last frame a texture was loading in; 0 = none yet
+        std::atomic<uint32_t> hidden_since{ 0 }; // the frame the mod was first hidden in; 0 = it was not
+        std::atomic<bool> shown{ false }; // the mod has been drawn: it is not hidden again
+    };
+    static constexpr int kAppearances = 1024; // mods with a higher id are never hidden
+    std::array<Appearance, kAppearances> appearances_;
     std::mutex mtx_;
     std::condition_variable cv_;
     bool stop_ = false; // under mtx_

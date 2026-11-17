@@ -1033,6 +1033,7 @@ constexpr uint32_t kModVectorStride = 8;    // vb1 TangentX + TangentZ, R8G8B8A8
 constexpr uint32_t kModTexcoordStride = 16; // vb2
 constexpr uint32_t kModColorStride = 4;     // vb3 R8G8B8A8_UNORM
 constexpr uint32_t kModBlendStride = 16;    // vb4: 8 bone indices, 8 weights
+constexpr uint32_t kModBlendStrideFour = 8; // vb4 of mods made with 4 weights per vertex: 4 indices, 4 weights
 constexpr uint32_t kOutTangentStride = 16;  // our tangents: R16G16B16A16_SNORM x2
 // Our outputs at the draw: vertex buffers, and buffer SRVs the vertex shader loads by vertex id.
 constexpr D3D12_RESOURCE_STATES kDrawReadState =
@@ -1596,7 +1597,7 @@ bool EnsurePtSkinPipeline(ID3D12Device* device)
     D3D12_ROOT_PARAMETER params[9] = {};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     params[0].Constants.ShaderRegister = 0; // b0: vertex count, bone count, scale
-    params[0].Constants.Num32BitValues = 4;
+    params[0].Constants.Num32BitValues = 5;
     for (UINT t = 0; t < 5; ++t) { // t0 bones, t1 positions, t2 vectors, t3 weights, t4 colors
         params[1 + t].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
         params[1 + t].Descriptor.ShaderRegister = t;
@@ -2009,7 +2010,8 @@ VfRestore RtDrawPass::SkinDraw(reshade::api::command_list* cmd_list, ID3D12Graph
     const MigotoPort::ShimVbRecord& colors = port.shim_vb[3];
     const MigotoPort::ShimVbRecord& blend = port.shim_vb[4];
     if (positions.stride != kModPositionStride || vectors.stride != kModVectorStride ||
-        texcoords.stride != kModTexcoordStride || colors.stride != kModColorStride || blend.stride != kModBlendStride ||
+        texcoords.stride != kModTexcoordStride || colors.stride != kModColorStride ||
+        (blend.stride != kModBlendStride && blend.stride != kModBlendStrideFour) ||
         !positions.va || !vectors.va || !texcoords.va || !colors.va || !blend.va || port.layout_override.count) {
         s_ptskin_skipped.fetch_add(1, std::memory_order_relaxed);
         if (LogOnce(10, once_key))
@@ -2022,7 +2024,7 @@ VfRestore RtDrawPass::SkinDraw(reshade::api::command_list* cmd_list, ID3D12Graph
     // Mods' buffers can differ by a few vertices (padding); skin as many as every one of them holds.
     uint32_t vertices = positions.size / kModPositionStride;
     vertices = (std::min)(vertices, (uint32_t)(vectors.size / kModVectorStride));
-    vertices = (std::min)(vertices, (uint32_t)(blend.size / kModBlendStride));
+    vertices = (std::min)(vertices, (uint32_t)(blend.size / blend.stride));
     vertices = (std::min)(vertices, (uint32_t)(colors.size / kModColorStride));
     if (vertices == 0) {
         s_ptskin_skipped.fetch_add(1, std::memory_order_relaxed);
@@ -2156,11 +2158,12 @@ VfRestore RtDrawPass::SkinDraw(reshade::api::command_list* cmd_list, ID3D12Graph
     Xit(d3d12_cl, gen, outputs->colors, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     if (has_previous) Xit(d3d12_cl, gen, outputs->previous_positions, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
-    uint32_t constants[4] = { vertices, bone_count, 0, 1 };
+    const uint32_t weights_per_vertex = blend.stride / 2; // half of vb4 is bone indices, half weights
+    uint32_t constants[5] = { vertices, bone_count, 0, 1, weights_per_vertex };
     memcpy(&constants[2], &section.scale, sizeof(float));
     d3d12_cl->SetComputeRootSignature(s_gpu.root_signature.Get());
     d3d12_cl->SetPipelineState(s_gpu.pso.Get());
-    d3d12_cl->SetComputeRoot32BitConstants(0, 4, constants, 0);
+    d3d12_cl->SetComputeRoot32BitConstants(0, 5, constants, 0);
     d3d12_cl->SetComputeRootShaderResourceView(1, bones_va);
     d3d12_cl->SetComputeRootShaderResourceView(2, positions.va);
     d3d12_cl->SetComputeRootShaderResourceView(3, vectors.va);
@@ -2171,9 +2174,9 @@ VfRestore RtDrawPass::SkinDraw(reshade::api::command_list* cmd_list, ID3D12Graph
     d3d12_cl->SetComputeRootUnorderedAccessView(8, outputs->colors.va());
     d3d12_cl->Dispatch((vertices + 63) / 64, 1, 1);
     if (has_previous) { // the same vertices with the previous frame's palette, positions only
-        uint32_t previous_constants[4] = { vertices, previous_bone_count, 0, 0 };
+        uint32_t previous_constants[5] = { vertices, previous_bone_count, 0, 0, weights_per_vertex };
         memcpy(&previous_constants[2], &section.scale, sizeof(float));
-        d3d12_cl->SetComputeRoot32BitConstants(0, 4, previous_constants, 0);
+        d3d12_cl->SetComputeRoot32BitConstants(0, 5, previous_constants, 0);
         d3d12_cl->SetComputeRootShaderResourceView(1, previous_slot->va());
         d3d12_cl->SetComputeRootUnorderedAccessView(6, outputs->previous_positions.va());
         d3d12_cl->Dispatch((vertices + 63) / 64, 1, 1);
