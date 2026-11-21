@@ -20,6 +20,7 @@ void AddonSettings::Load(const std::wstring& path)
     decensor = Int(L"decensor", 0) != 0;
     hide_uid = Int(L"hide_uid", 0) != 0;
     oil_off = Int(L"oil_off", 0) != 0;
+    hide_char_outlines = Int(L"hide_char_outlines", 0) != 0;
 #ifdef WWMI_DEBUG
     hide_outline = Int(L"hide_outline", 0) != 0;
 #endif
